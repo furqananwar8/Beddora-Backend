@@ -1,6 +1,8 @@
+import { EntityManager } from '@mikro-orm/core';
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
+import { User } from 'src/entities/user.entity';
 import { SessionData, SessionService } from 'src/modules/session/service/session.service';
 
 
@@ -17,43 +19,73 @@ export class AuthService {
   constructor(
     private config: ConfigService,
     private sessionService: SessionService,
+    private em: EntityManager
   ) {}
 
   // Step 1 — Exchange authorization code for tokens
   async exchangeCodeForTokens(code: string): Promise<{ sessionId: string; expiresIn: number }> {
+    // Exchange code for tokens
     const tokenRes = await fetch('https://api.amazon.com/auth/o2/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         grant_type: 'authorization_code',
         code,
-        client_id: this.config.get('AMAZON_CLIENT_ID')!,
-        client_secret: this.config.get('AMAZON_CLIENT_SECRET')!,
-        redirect_uri: this.config.get('AMAZON_REDIRECT_URI')!,
+        client_id: this.config.getOrThrow('AMAZON_CLIENT_ID'),
+        client_secret: this.config.getOrThrow('AMAZON_CLIENT_SECRET'),
+        redirect_uri: this.config.getOrThrow('AMAZON_REDIRECT_URI'),
       }),
     });
 
     const tokenData: AmazonTokenResponse = await tokenRes.json();
-
     if (tokenData.error || !tokenData.access_token) {
       throw new UnauthorizedException(`Amazon token exchange failed: ${tokenData.error}`);
     }
 
+    // Fetch profile
+    const profileRes = await fetch('https://api.amazon.com/user/profile', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    if (!profileRes.ok) {
+      throw new UnauthorizedException('Failed to fetch Amazon profile');
+    }
+    const profile = await profileRes.json();
+
+    // Upsert user by stable amazon_user_id
+    let user = await this.em.findOne(User, { amazonUserId: profile.user_id });
+
+    if (user) {
+      this.em.assign(user, {
+        name: profile.name,
+        lastLoginAt: new Date(),
+      });
+    } else {
+      user = this.em.create(User, {
+        amazonUserId: profile.user_id,
+        name: profile.name,
+        lastLoginAt: new Date(),
+      });
+    }
+
+    await this.em.persist(user).flush();
+
+    // Create Redis session
     const sessionId = randomBytes(32).toString('base64url');
     const expiresAt = Date.now() + tokenData.expires_in * 1000;
 
     const sessionData: SessionData = {
+      userId: user.id!,
       access_token: tokenData.access_token,
       refresh_token: tokenData.refresh_token,
       token_type: tokenData.token_type,
       expires_at: expiresAt,
     };
 
-    // TTL slightly less than token expiry so session dies with the token
     await this.sessionService.create(sessionId, sessionData, tokenData.expires_in - 60);
 
     return { sessionId, expiresIn: tokenData.expires_in };
   }
+
 
   // Step 2 — Retrieve a valid access token for a session (auto-refreshes if expired)
   async getValidAccessToken(sessionId: string): Promise<string> {
@@ -74,7 +106,7 @@ export class AuthService {
   }
 
   // Step 3 — Refresh token flow
-  private async refreshAccessToken(sessionId: string, refreshToken: string): Promise<string> {
+  async refreshAccessToken(sessionId: string, refreshToken: string): Promise<string> {
     const res = await fetch('https://api.amazon.com/auth/o2/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },

@@ -1,9 +1,11 @@
-import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, OnModuleInit, OnModuleDestroy, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
+import { REDIS_CLIENT } from 'src/redis/redis.provider';
 
 export interface SessionData {
   access_token: string;
+  userId: number;
   refresh_token: string;
   token_type: string;
   expires_at: number; // unix timestamp ms
@@ -11,22 +13,8 @@ export interface SessionData {
 }
 
 @Injectable()
-export class SessionService implements OnModuleInit, OnModuleDestroy {
-  private redis!: Redis;
-
-  constructor(private config: ConfigService) {}
-
-  onModuleInit() {
-    this.redis = new Redis({
-      host: this.config.get('REDIS_HOST', 'localhost'),
-      port: this.config.get<number>('REDIS_PORT', 6379),
-      password: this.config.get('REDIS_PASSWORD'),
-    });
-  }
-
-  onModuleDestroy() {
-    this.redis.disconnect();
-  }
+export class SessionService  {
+  constructor(@Inject(REDIS_CLIENT) private readonly redis: Redis) {}
 
   async create(sessionId: string, data: SessionData, ttlSeconds: number): Promise<void> {
     await this.redis.set(

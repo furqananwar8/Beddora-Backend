@@ -11,13 +11,23 @@ import {
 import type { Response, Request } from 'express';
 import { ApiTags, ApiOperation, ApiResponse, ApiQuery, ApiCookieAuth } from '@nestjs/swagger';
 import { AuthService } from '../service/auth.service';
+import { SessionService } from 'src/modules/session/service/session.service';
+import { EntityManager } from '@mikro-orm/core';
+import { User } from 'src/entities/user.entity';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
+import { AMAZON_TOKEN_REFRESH, REFRESH_JOB_DELAY_MS } from 'src/common/constants/bullmq.constant';
 
 const SESSION_COOKIE = 'sid';
 
 @ApiTags('Auth')
 @Controller('auth')
 export class AuthController {
-  constructor(private authService: AuthService) {}
+  constructor(
+    private em: EntityManager, 
+    private authService: AuthService, 
+    private sessionService: SessionService,
+   @InjectQueue(AMAZON_TOKEN_REFRESH) private readonly tokenRefreshQueue: Queue) {}
 
   @Get('amazon/callback')
   @ApiOperation({
@@ -51,6 +61,12 @@ export class AuthController {
       path: '/',
     });
 
+    this.tokenRefreshQueue.add(
+      'refresh',
+      { sessionId },
+      { delay: REFRESH_JOB_DELAY_MS },
+    );
+
     return res.redirect(process.env.FRONTEND_REDIRECT_URL ?? '/dashboard');
   }
 
@@ -62,16 +78,24 @@ export class AuthController {
   })
   @ApiResponse({ status: 200, description: 'Session is valid', schema: { example: { authenticated: true } } })
   @ApiResponse({ status: 401, description: 'No session cookie or session expired' })
-  async getSession(@Req() req: Request) {
+  async getSession(@Req() req: Request, @Res() res: Response) {
     const sessionId = req.cookies?.[SESSION_COOKIE];
+    if (!sessionId) throw new UnauthorizedException('No session found');
 
-    if (!sessionId) {
-      throw new UnauthorizedException('No session');
+    const session = await this.sessionService.get(sessionId);
+    if (!session) throw new UnauthorizedException('Session expired');
+    
+    const user = await this.em.findOne(User, { id: session.userId });
+    const finalUserOutput = {...user};
+    delete finalUserOutput.amazonUserId;
+    
+    if (!user) {
+      await this.sessionService.delete(sessionId);
+      res.clearCookie(SESSION_COOKIE);
+      throw new UnauthorizedException('User not found');
     }
 
-    await this.authService.getValidAccessToken(sessionId);
-
-    return { authenticated: true };
+    return res.status(200).json({ message: "Profile retrieved successfully", user: finalUserOutput });
   }
 
   @Post('logout')
@@ -89,6 +113,6 @@ export class AuthController {
     }
 
     res.clearCookie(SESSION_COOKIE);
-    return res.json({ success: true });
+    return res.status(200).json({ message: 'Logged user out successfully' });
   }
 }
