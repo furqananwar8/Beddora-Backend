@@ -17,6 +17,7 @@ import { User } from 'src/entities/user.entity';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { AMAZON_TOKEN_REFRESH, REFRESH_JOB_DELAY_MS } from 'src/common/constants/bullmq.constant';
+import { ConfigService } from '@nestjs/config';
 
 const SESSION_COOKIE = 'sid';
 
@@ -27,33 +28,104 @@ export class AuthController {
     private em: EntityManager, 
     private authService: AuthService, 
     private sessionService: SessionService,
-   @InjectQueue(AMAZON_TOKEN_REFRESH) private readonly tokenRefreshQueue: Queue) {}
+    @InjectQueue(AMAZON_TOKEN_REFRESH) private readonly tokenRefreshQueue: Queue,
+    private readonly configService: ConfigService
+  ) {}
+  
+  @Get('amazon/login')
+  @ApiOperation({ summary: 'Initiate Amazon OAuth login' })
+  @ApiCookieAuth('sid')
+  @ApiResponse({ status: 200, description: 'Amazon OAuth URL', schema: { example: { url: 'https://www.amazon.com/ap/oa?...' } } })
+  async amazonLogin(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
+    const existingSessionId = req.cookies?.[SESSION_COOKIE];
+    const state = crypto.randomUUID();
+
+    if (existingSessionId) {
+      await this.sessionService.update(existingSessionId, { oauthState: state }, 300);
+    } else {
+        // Create new session — generate ID here to match your signature
+        const newSessionId = crypto.randomUUID();
+        await this.sessionService.create(
+          newSessionId,
+          {
+            oauthState: state,
+            userId: '',
+            access_token: '',
+            refresh_token: '',
+            token_type: '',
+            expires_at: 0,
+          },
+          300, // 5 min TTL for OAuth state
+        );
+        
+        // Set the session cookie so the callback can read it
+        res.cookie(SESSION_COOKIE, newSessionId, {
+          httpOnly: true,
+          secure: process.env.NODE_ENV === 'production',
+          sameSite: 'lax',
+          maxAge: 300 * 1000,
+        });
+    }
+
+    const params = new URLSearchParams({
+      client_id: this.configService.getOrThrow('AMAZON_CLIENT_ID'),
+      response_type: 'code',
+      redirect_uri: this.configService.getOrThrow('AMAZON_REDIRECT_URI'),
+      scope: 'profile',
+      state,
+    });
+
+    return { url: `https://www.amazon.com/ap/oa?${params.toString()}` };
+  }
 
   @Get('amazon/callback')
   @ApiOperation({
     summary: 'Amazon OAuth callback',
-    description: 'Exchanges the authorization code from Amazon for tokens, creates a server-side session and sets an HTTP-only cookie.',
+    description: 'Verifies OAuth state, exchanges code for tokens via AuthService, updates session cookie, and redirects to frontend.',
   })
-  @ApiQuery({ name: 'code', required: false, description: 'Authorization code returned by Amazon' })
-  @ApiQuery({ name: 'error', required: false, description: 'Error returned by Amazon if user denied access' })
-  @ApiResponse({ status: 302, description: 'Session created — redirects to frontend with sid cookie set' })
-  @ApiResponse({ status: 400, description: 'Missing code or Amazon returned an error' })
+  @ApiQuery({ name: 'code', required: false, description: 'Authorization code from Amazon' })
+  @ApiQuery({ name: 'state', required: false, description: 'OAuth state for CSRF protection' })
+  @ApiQuery({ name: 'error', required: false, description: 'Error if user denied access' })
+  @ApiCookieAuth('sid')
+  @ApiResponse({ status: 302, description: 'Redirects to frontend dashboard' })
+  @ApiResponse({ status: 400, description: 'Missing code or Amazon error' })
+  @ApiResponse({ status: 401, description: 'No session, expired session, or invalid state' })
   async amazonCallback(
     @Query('code') code: string,
+    @Query('state') state: string,
     @Query('error') error: string,
+    @Req() req: Request,
     @Res() res: Response,
   ) {
     if (error) {
       throw new BadRequestException(`Amazon OAuth error: ${error}`);
     }
-
     if (!code) {
       throw new BadRequestException('Missing authorization code');
     }
 
-    const { sessionId, expiresIn } = await this.authService.exchangeCodeForTokens(code);
+    // Verify state against the session created in /amazon/login
+    const sessionId = req.cookies?.[SESSION_COOKIE];
+    if (!sessionId) {
+      throw new UnauthorizedException('No session found');
+    }
 
-    res.cookie(SESSION_COOKIE, sessionId, {
+    const session = await this.sessionService.get(sessionId);
+    if (!session) {
+      throw new UnauthorizedException('Session expired');
+    }
+    if (state !== session.oauthState) {
+      throw new UnauthorizedException('Invalid OAuth state');
+    }
+
+    // Service handles token exchange, profile, user upsert, and session update
+    const { sessionId: finalSessionId, expiresIn } = await this.authService.exchangeCodeForTokens(
+      code,
+      sessionId, // pass existing session so it updates instead of creating new
+    );
+
+    // Refresh cookie TTL to match token expiry
+    res.cookie(SESSION_COOKIE, finalSessionId, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
@@ -84,8 +156,8 @@ export class AuthController {
 
     const session = await this.sessionService.get(sessionId);
     if (!session) throw new UnauthorizedException('Session expired');
-    
-    const user = await this.em.findOne(User, { id: session.userId });
+
+    const user = await this.em.findOne(User, { id: parseInt(session.userId) });
     const finalUserOutput = {...user};
     delete finalUserOutput.amazonUserId;
     

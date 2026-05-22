@@ -23,7 +23,10 @@ export class AuthService {
   ) {}
 
   // Step 1 — Exchange authorization code for tokens
-  async exchangeCodeForTokens(code: string): Promise<{ sessionId: string; expiresIn: number }> {
+ async exchangeCodeForTokens(
+  code: string,
+  existingSessionId: string,
+): Promise<{ sessionId: string; expiresIn: number }> {
     // Exchange code for tokens
     const tokenRes = await fetch('https://api.amazon.com/auth/o2/token', {
       method: 'POST',
@@ -46,6 +49,7 @@ export class AuthService {
     const profileRes = await fetch('https://api.amazon.com/user/profile', {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
+
     if (!profileRes.ok) {
       throw new UnauthorizedException('Failed to fetch Amazon profile');
     }
@@ -74,16 +78,17 @@ export class AuthService {
     const expiresAt = Date.now() + tokenData.expires_in * 1000;
 
     const sessionData: SessionData = {
-      userId: user.id!,
+      userId: String(user.id)!,
       access_token: tokenData.access_token,
       refresh_token: tokenData.refresh_token,
       token_type: tokenData.token_type,
       expires_at: expiresAt,
+      oauthState: undefined,
     };
 
-    await this.sessionService.create(sessionId, sessionData, tokenData.expires_in - 60);
+    await this.sessionService.update(existingSessionId, sessionData, tokenData.expires_in - 60);
 
-    return { sessionId, expiresIn: tokenData.expires_in };
+    return { sessionId: existingSessionId, expiresIn: tokenData.expires_in };
   }
 
 
@@ -133,6 +138,7 @@ export class AuthService {
         access_token: tokenData.access_token,
         refresh_token: tokenData.refresh_token ?? refreshToken, // Amazon may or may not rotate it
         expires_at: Date.now() + tokenData.expires_in * 1000,
+        oauthState: undefined,
       },
       tokenData.expires_in - 60,
     );

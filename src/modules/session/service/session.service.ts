@@ -1,15 +1,15 @@
-import { Injectable, OnModuleInit, OnModuleDestroy, Inject } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
+import { Injectable, Inject } from '@nestjs/common';
 import Redis from 'ioredis';
 import { REDIS_CLIENT } from 'src/redis/redis.provider';
 
 export interface SessionData {
   access_token: string;
-  userId: number;
+  userId: string;
   refresh_token: string;
   token_type: string;
   expires_at: number; // unix timestamp ms
   user_id?: string;   // Amazon user ID (from /user/profile if needed)
+  oauthState?: string;
 }
 
 @Injectable()
