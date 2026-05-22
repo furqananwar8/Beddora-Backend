@@ -15,7 +15,9 @@ export interface SessionData {
 @Injectable()
 export class SessionService  {
   constructor(@Inject(REDIS_CLIENT) private readonly redis: Redis) {}
+   
 
+  
   async create(sessionId: string, data: SessionData, ttlSeconds: number): Promise<void> {
     await this.redis.set(
       `session:${sessionId}`,

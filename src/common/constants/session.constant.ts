@@ -1,0 +1,4 @@
+export const SESSION_COOKIE = 'sid';
+export const SESSION_NOT_FOUND = "SESSION_NOT_FOUND";
+export const SESSION_EXPIRED = "SESSION_EXPIRED";
+export const SESSION_INVALID = "SESSION_INVALID";

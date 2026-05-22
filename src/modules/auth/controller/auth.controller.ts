@@ -7,6 +7,7 @@ import {
   Post,
   BadRequestException,
   UnauthorizedException,
+  UseGuards,
 } from '@nestjs/common';
 import type { Response, Request } from 'express';
 import { ApiTags, ApiOperation, ApiResponse, ApiQuery, ApiCookieAuth } from '@nestjs/swagger';
@@ -18,8 +19,9 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { AMAZON_TOKEN_REFRESH, REFRESH_JOB_DELAY_MS } from 'src/common/constants/bullmq.constant';
 import { ConfigService } from '@nestjs/config';
-
-const SESSION_COOKIE = 'sid';
+import { SessionAuthGuard } from 'src/guards/SessionAuth.guard';
+import { SESSION_COOKIE } from 'src/common/constants/session.constant';
+import { randomBytes } from 'crypto';
 
 @ApiTags('Auth')
 @Controller('auth')
@@ -44,7 +46,7 @@ export class AuthController {
       await this.sessionService.update(existingSessionId, { oauthState: state }, 300);
     } else {
         // Create new session — generate ID here to match your signature
-        const newSessionId = crypto.randomUUID();
+        const newSessionId = randomBytes(32).toString('base64url');
         await this.sessionService.create(
           newSessionId,
           {
@@ -143,6 +145,7 @@ export class AuthController {
   }
 
   @Get('me')
+  @UseGuards(SessionAuthGuard)
   @ApiCookieAuth('sid')
   @ApiOperation({
     summary: 'Validate current session',
@@ -171,6 +174,7 @@ export class AuthController {
   }
 
   @Post('logout')
+  @UseGuards(SessionAuthGuard)
   @ApiCookieAuth('sid')
   @ApiOperation({
     summary: 'Logout',

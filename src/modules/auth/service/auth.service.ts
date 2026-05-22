@@ -74,7 +74,6 @@ export class AuthService {
     await this.em.persist(user).flush();
 
     // Create Redis session
-    const sessionId = randomBytes(32).toString('base64url');
     const expiresAt = Date.now() + tokenData.expires_in * 1000;
 
     const sessionData: SessionData = {

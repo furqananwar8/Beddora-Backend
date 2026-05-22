@@ -26,6 +26,8 @@ async function bootstrap() {
 
   app.use(cookieParser());
 
+  app.setGlobalPrefix("/api/")
+  
   const config = new DocumentBuilder()
   .setTitle('Amazon Ads API')
   .setDescription('Amazon OAuth + Ads API integration')
