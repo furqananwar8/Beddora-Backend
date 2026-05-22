@@ -63,8 +63,9 @@ export class AuthController {
         // Set the session cookie so the callback can read it
         res.cookie(SESSION_COOKIE, newSessionId, {
           httpOnly: true,
-          secure: process.env.NODE_ENV === 'production',
-          sameSite: 'lax',
+          sameSite: 'none',
+          secure: true,
+          path: '/',
           maxAge: 300 * 1000,
         });
     }
@@ -125,12 +126,11 @@ export class AuthController {
       code,
       sessionId, // pass existing session so it updates instead of creating new
     );
-
     // Refresh cookie TTL to match token expiry
     res.cookie(SESSION_COOKIE, finalSessionId, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
+      sameSite: 'none',
+      secure: true,
       maxAge: (expiresIn - 60) * 1000,
       path: '/',
     });
@@ -141,7 +141,7 @@ export class AuthController {
       { delay: REFRESH_JOB_DELAY_MS },
     );
 
-    return res.redirect(process.env.FRONTEND_REDIRECT_URL ?? '/dashboard');
+    return res.json({ success: true, sessionId: finalSessionId });
   }
 
   @Get('me')
