@@ -9,8 +9,13 @@ async function bootstrap() {
 
   const configService = app.get(ConfigService);
 
-  const allowedOrigins = configService.get<string>('CORS_ORIGINS')?.split(',') ?? [];
+  const allowedOrigins = configService
+    .get<string>('CORS_ORIGINS')
+    ?.split(',')
+    .map(o => o.trim())        // ← trim whitespace just in case
+    .filter(Boolean) ?? [];
 
+  console.log('CORS allowed origins:', allowedOrigins);
   app.enableCors({
     origin: (origin: string, callback: (error?: Error | null, val?: boolean | null) => void) => {
       if (!origin || allowedOrigins.includes(origin)) {

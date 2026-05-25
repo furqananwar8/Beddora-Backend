@@ -1,66 +1,193 @@
-import { Injectable } from '@nestjs/common';
+// src/campaign-schedule/campaign-schedule.service.ts
+import { Injectable, BadRequestException } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
 import { EntityManager } from '@mikro-orm/core';
+import { DateTime } from 'luxon';
 import { ScheduleStatus } from 'src/common/enum/campaign.enum';
 import { CampaignSchedule } from 'src/entities/campaign-schedule.entity';
-import { CreateScheduleDto } from '../dto/campaign-schedule.dto';
-
+import { CreateCampaignScheduleDto } from '../dto/campaign-schedule.dto';
 
 @Injectable()
 export class CampaignScheduleService {
-  constructor(private readonly em: EntityManager) {}
+  constructor(
+    private readonly em: EntityManager,
+    @InjectQueue('campaign-schedule') private readonly scheduleQueue: Queue,
+  ) {}
 
   /**
-   * Sync schedules for a campaign.
-   * - Dates no longer sent → DELETED from DB
-   * - Dates already sent but slots changed → UPDATED
-   * - New dates → INSERTED
+   * Schedule a single campaign (POST /:campaignId/schedule)
    */
-  async syncSchedules(campaignId: number, dtos: CreateScheduleDto[]): Promise<void> {
-    const em = this.em.fork();
+  async schedule(campaignId: number, dto: CreateCampaignScheduleDto) {
+    const scheduleDate = this.normalizeDate(dto.scheduleDate);
+    const endDate = dto.endDate ? this.normalizeDate(dto.endDate) : undefined;
 
-    // 1. Load existing schedules for this campaign
-    const existing = await em.find(CampaignSchedule, { campaignId });
-    const incomingDates = new Set(dtos.map((d) => d.scheduleDate));
+    const todayStr = DateTime.now().toISODate();
 
-    // 2. Delete dates the user removed (deselected old ones)
-    const toDelete = existing.filter((e) => !incomingDates.has(e.scheduleDate));
-    if (toDelete.length > 0) {
-      await em.nativeDelete(CampaignSchedule, {
-        id: { $in: toDelete.map((s) => s.id) },
+    const existing = await this.em.findOne(CampaignSchedule, {
+      campaignId,
+      scheduleDate: { $gte: todayStr },
+      status: { $in: [ScheduleStatus.PENDING, ScheduleStatus.SCHEDULED] },
+    });
+
+    let schedule: CampaignSchedule;
+    let isNew = false;
+
+    if (!existing) {
+      this.validateFuture(scheduleDate, dto.timeSlots, dto.timezone, campaignId);
+      schedule = this.em.create(CampaignSchedule, {
+        campaignId,
+        scheduleDate,
+        endDate: endDate ?? null,
+        timeSlots: dto.timeSlots,
+        timezone: dto.timezone,
+        action: dto.action,
+        status: ScheduleStatus.SCHEDULED,
+        createdAt: new Date(),
+        updatedAt: new Date(),
       });
-    }
+      isNew = true;
+    } else {
+      const changed =
+        existing.scheduleDate !== scheduleDate ||
+        existing.endDate !== (endDate ?? null) ||
+        existing.timezone !== dto.timezone ||
+        existing.action !== dto.action ||
+        JSON.stringify(existing.timeSlots) !== JSON.stringify(dto.timeSlots);
 
-    // 3. Upsert: update existing dates, insert new ones
-    for (const dto of dtos) {
-      const match = existing.find((e) => e.scheduleDate === dto.scheduleDate);
-
-      if (match) {
-        // Update slots / action / times if user changed them
-        match.timeSlots = dto.timeSlots;
-        match.action = dto.action;
-        match.timezone = dto.timezone;
-        match.bidAdjustment = dto.bidAdjustment;
-        match.endDate = dto.endDate;
-        match.status = ScheduleStatus.QUEUED; // reset if it was completed
-      } else {
-        // Brand new date
-        const schedule = new CampaignSchedule();
-        schedule.campaignId = campaignId;
-        schedule.scheduleDate = dto.scheduleDate;
-        schedule.endDate = dto.endDate;
-        schedule.timeSlots = dto.timeSlots;
-        schedule.timezone = dto.timezone;
-        schedule.action = dto.action;
-        schedule.bidAdjustment = dto.bidAdjustment;
-        schedule.status = ScheduleStatus.QUEUED;
-        em.persist(schedule);
+      if (!changed) {
+        return { message: 'No changes detected', schedule: existing };
       }
+
+      this.validateFuture(scheduleDate, dto.timeSlots, dto.timezone, campaignId);
+      existing.scheduleDate = scheduleDate;
+      if(endDate) existing.endDate = endDate;
+      existing.timeSlots = dto.timeSlots;
+      existing.timezone = dto.timezone;
+      existing.action = dto.action;
+      existing.status = ScheduleStatus.SCHEDULED;
+      schedule = existing;
     }
 
-    await em.flush();
+    await this.em.flush();
+
+    if (existing) {
+      await this.removeJob(existing.id);
+    }
+    await this.upsertJob(schedule);
+    await this.em.flush();
+
+    return {
+      message: isNew ? 'Campaign scheduled' : 'Schedule updated',
+      schedule,
+    };
   }
 
-  async getSchedules(campaignId: number): Promise<CampaignSchedule[]> {
-    return this.em.fork().find(CampaignSchedule, { campaignId });
+  /**
+   * Unschedule a single campaign (DELETE /:campaignId)
+   */
+  async unschedule(campaignId: number) {
+    const todayStr = DateTime.now().toISODate();
+
+    const existing = await this.em.findOne(CampaignSchedule, {
+      campaignId,
+      scheduleDate: { $gte: todayStr },
+      status: { $in: [ScheduleStatus.PENDING, ScheduleStatus.SCHEDULED] },
+    });
+
+    if (!existing) {
+      return { message: 'No future schedule found for this campaign', campaignId };
+    }
+
+    await this.removeJob(existing.id);
+    this.em.remove(existing);
+    await this.em.flush();
+
+    return { message: 'Schedule removed', campaignId };
+  }
+
+  // -------------------------------------------------------------------------
+  // Helpers
+  // -------------------------------------------------------------------------
+
+  private normalizeDate(raw: string): string {
+    if (/^\d{8}$/.test(raw)) {
+      return DateTime.fromFormat(raw, 'yyyyMMdd').toISODate()!;
+    }
+    return raw;
+  }
+
+  private validateFuture(
+    date: string,
+    timeSlots: Array<{ startTime: string }>,
+    timezone: string,
+    campaignId: number,
+  ) {
+    const delay = this.getDelayMs(date, timeSlots, timezone);
+    if (delay <= 0) {
+      const timeStr = timeSlots[0]?.startTime ?? '';
+      throw new BadRequestException(
+        `Campaign ${campaignId} schedule must be in the future (${date} ${timeStr})`,
+      );
+    }
+  }
+
+  private getDelayMs(
+    date: string,
+    timeSlots: Array<{ startTime: string }>,
+    timezone: string,
+  ): number {
+    if (!timeSlots?.length) return -1;
+    const scheduled = DateTime.fromISO(`${date}T${timeSlots[0].startTime}`, {
+      zone: timezone,
+    });
+    const now = DateTime.now().setZone(timezone);
+    return Math.max(scheduled.diff(now).milliseconds, 0);
+  }
+
+  // src/campaign-schedule/campaign-schedule.service.ts
+
+    private getJobId(scheduleId: number): string {
+    return `campaign-schedule-${scheduleId}`; // ← dash instead of colon
+    }
+
+  private async removeJob(scheduleId: number) {
+    const jobId = this.getJobId(scheduleId);
+    try {
+      const job = await this.scheduleQueue.getJob(jobId);
+      if (job) await job.remove();
+    } catch (e) {
+      console.error(`Failed to remove job ${jobId}`, e);
+    }
+  }
+
+  private async upsertJob(schedule: CampaignSchedule) {
+    const jobId = this.getJobId(schedule.id);
+    const delay = this.getDelayMs(
+      schedule.scheduleDate,
+      schedule.timeSlots,
+      schedule.timezone,
+    );
+
+    try {
+      await this.scheduleQueue.add(
+        'execute-schedule',
+        {
+          campaignScheduleId: schedule.id,
+          campaignId: schedule.campaignId,
+          action: schedule.action,
+        },
+        {
+          jobId,
+          delay,
+          removeOnComplete: true,
+          removeOnFail: 10,
+        },
+      );
+      schedule.status = ScheduleStatus.SCHEDULED;
+    } catch (e) {
+      console.error(`Failed to queue job ${jobId}`, e);
+      schedule.status = ScheduleStatus.FAILED;
+    }
   }
 }

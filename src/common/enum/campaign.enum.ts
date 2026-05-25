@@ -10,4 +10,6 @@ export enum ScheduleStatus {
   COMPLETED = 'COMPLETED',
   FAILED = 'FAILED',
   CANCELLED = 'CANCELLED',
+  SCHEDULED = 'SCHEDULED',
+  PENDING = 'PENDING'
 }
