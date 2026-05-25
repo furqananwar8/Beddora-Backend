@@ -12,6 +12,7 @@ import { AppService } from './app.service';
 import { REDIS_CLIENT } from './redis/redis.provider';
 import Redis from 'ioredis';
 import { AMAZON_TOKEN_REFRESH } from './common/constants/bullmq.constant';
+import { CampaignModule } from './modules/campaign/campaign.module';
 
 @Module({
   imports: [
@@ -49,6 +50,7 @@ import { AMAZON_TOKEN_REFRESH } from './common/constants/bullmq.constant';
     
     SessionModule,
     AuthModule,
+    CampaignModule,
   ],
   providers: [AppService],
   controllers: [AppController],

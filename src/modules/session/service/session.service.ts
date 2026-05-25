@@ -15,12 +15,10 @@ export interface SessionData {
 @Injectable()
 export class SessionService  {
   constructor(@Inject(REDIS_CLIENT) private readonly redis: Redis) {}
-   
-
   
   async create(sessionId: string, data: SessionData, ttlSeconds: number): Promise<void> {
     await this.redis.set(
-      `session:${sessionId}`,
+      `session-beddora:${sessionId}`,
       JSON.stringify(data),
       'EX',
       ttlSeconds,
@@ -28,7 +26,7 @@ export class SessionService  {
   }
 
   async get(sessionId: string): Promise<SessionData | null> {
-    const raw = await this.redis.get(`session:${sessionId}`);
+    const raw = await this.redis.get(`session-beddora:${sessionId}`);
     if (!raw) return null;
     return JSON.parse(raw) as SessionData;
   }

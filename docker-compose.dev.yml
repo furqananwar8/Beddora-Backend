@@ -1,0 +1,79 @@
+version: "3.9"
+
+services:
+  beddora-postgres:
+    container_name: beddora-postgres
+    hostname: beddora-postgres
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: furqan
+      POSTGRES_PASSWORD: root
+      POSTGRES_DB: beddora_dev
+    ports:
+      - "5433:5432"
+    volumes:
+      - beddora_campaign_postgres_data:/var/lib/postgresql/data
+    networks:
+      beddora_network:
+        aliases:
+          - beddora-postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U furqan -d beddora_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  beddora-redis:
+    container_name: beddora-redis
+    hostname: beddora-redis
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    volumes:
+      - beddora_campaign_redis_data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+    networks:
+      beddora_network:
+        aliases:
+          - beddora-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  beddora-backend:
+    container_name: beddora-backend
+    hostname: beddora-backend
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    env_file:
+      - .env.docker
+    depends_on:
+      beddora-postgres:
+        condition: service_healthy
+      beddora-redis:
+        condition: service_healthy
+    networks:
+      - beddora_network
+
+volumes:
+  beddora_campaign_postgres_data:
+  beddora_campaign_redis_data:
+
+networks:
+  beddora_network:
+    name: beddora_network
+    driver: bridge

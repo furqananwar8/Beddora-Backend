@@ -1,0 +1,13 @@
+export enum ScheduleAction {
+  ENABLE = 'ENABLE',
+  PAUSE = 'PAUSE',
+  ADJUST_BID = 'ADJUST_BID',
+}
+
+export enum ScheduleStatus {
+  QUEUED = 'QUEUED',
+  RUNNING = 'RUNNING',
+  COMPLETED = 'COMPLETED',
+  FAILED = 'FAILED',
+  CANCELLED = 'CANCELLED',
+}
