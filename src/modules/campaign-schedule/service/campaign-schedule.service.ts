@@ -4,9 +4,10 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { EntityManager } from '@mikro-orm/core';
 import { DateTime } from 'luxon';
-import { ScheduleStatus } from 'src/common/enum/campaign.enum';
+import { ScheduleAction, ScheduleStatus } from 'src/common/enum/campaign.enum';
 import { CampaignSchedule } from 'src/entities/campaign-schedule.entity';
 import { CreateCampaignScheduleDto } from '../dto/campaign-schedule.dto';
+import { Campaign } from 'src/entities/campaigns.entity';
 
 @Injectable()
 export class CampaignScheduleService {
@@ -105,6 +106,71 @@ export class CampaignScheduleService {
 
     return { message: 'Schedule removed', campaignId };
   }
+
+    // src/campaign-schedule/campaign-schedule.service.ts
+
+    async createFakeCampaigns(count: number = 3): Promise<any[]> {
+        const campaigns: any[] = [];
+
+        for (let i = 0; i < count; i++) {
+            const fakeId = Math.floor(100_000_000 + Math.random() * 900_000_000);
+            const todayStr = DateTime.now().toISODate()!; // yyyy-MM-dd
+
+            const campaign = this.em.create(Campaign, {
+            campaignId: fakeId,
+            name: `Fake Sync ${fakeId}`,
+            campaignType: 'sponsoredProducts',
+            targetingType: 'manual',
+            state: 'ENABLED',
+            dailyBudget: 10.00,
+            startDate: todayStr,
+            endDate: null,
+            premiumBidAdjustment: false,
+            bidding: null,
+            profileId: 0,
+            lastSyncedAt: new Date(),
+            });
+
+            campaigns.push(campaign);
+        }
+
+        await this.em.flush();
+        return campaigns;
+    }
+
+    /**
+     * Keep your existing signature — creates a schedule row + BullMQ job.
+     */
+    async createFakeSchedule(
+    campaignId: number,
+    delaySeconds: number,
+    action: ScheduleAction,
+    ): Promise<CampaignSchedule> {
+    const future = DateTime.now().plus({ seconds: delaySeconds });
+
+    const schedule = this.em.create(CampaignSchedule, {
+        campaignId,
+        scheduleDate: future.toISODate()!,
+        endDate: null,
+        timeSlots: [
+        {
+            startTime: future.toFormat('HH:mm'),
+            endTime: future.plus({ minutes: 1 }).toFormat('HH:mm'),
+        },
+        ],
+        timezone: 'UTC',
+        action,
+        status: ScheduleStatus.SCHEDULED,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+    });
+
+    await this.em.flush();
+    await this.upsertJob(schedule);
+    await this.em.flush();
+
+    return schedule;
+    }
 
   // -------------------------------------------------------------------------
   // Helpers
