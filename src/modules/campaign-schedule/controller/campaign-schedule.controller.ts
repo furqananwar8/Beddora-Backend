@@ -1,11 +1,12 @@
 // src/campaign-schedule/campaign-schedule.controller.ts
-import { Controller, Post, Delete, Body, Sse, Param, ParseIntPipe } from '@nestjs/common';
+import { Controller, Post, Delete, Body, Sse, Param, ParseIntPipe, Header, Get, Req, Res } from '@nestjs/common';
 import { CampaignScheduleService } from '../service/campaign-schedule.service';
 import { Observable, of, timer, concat } from 'rxjs';
 import { concatMap, map, take } from 'rxjs/operators';
 import { ScheduleEventsService } from '../schedule-events.service';
-import { CreateCampaignScheduleDto } from '../dto/campaign-schedule.dto';
+import { BulkScheduleDto, CreateCampaignScheduleDto } from '../dto/campaign-schedule.dto';
 import { ScheduleAction } from 'src/common/enum/campaign.enum';
+import type{ Request, Response } from 'express';
 
 @Controller('campaign-schedules')
 export class CampaignScheduleController {
@@ -20,9 +21,9 @@ export class CampaignScheduleController {
   @Post(':campaignId/schedule')
   async schedule(
     @Param('campaignId', ParseIntPipe) campaignId: number,
-    @Body() dto: CreateCampaignScheduleDto,
+    @Body() dto: BulkScheduleDto,
   ) {
-    return this.service.schedule(campaignId, dto);
+    return this.service.bulkSchedule(campaignId, dto);
   }
 
   /**
@@ -116,9 +117,46 @@ export class CampaignScheduleController {
     ];
     return messages[index] ?? 'Processing...';
   }
-  
-  @Sse('events')
-  events(): Observable<{ data: any }> {
-    return this.scheduleEvents.getEvents();
+
+  @Get('events')
+  events(@Res() res: Response, @Req() req: Request) {
+    const origin = req.headers.origin ?? 'http://localhost:3001';
+
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    res.flushHeaders();
+
+    const stream$ = this.scheduleEvents.getEvents();
+
+    const subscription = stream$.subscribe({
+      next: (event) => {
+        if (!res.writableEnded) {
+          res.write(`data: ${JSON.stringify(event.data)}\n\n`);
+        }
+      },
+      error: (err) => {
+        if (!res.writableEnded) {
+          res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
+          res.end();
+        }
+      },
+      complete: () => {
+        if (!res.writableEnded) {
+          res.write(`event: complete\ndata: ${JSON.stringify({ done: true })}\n\n`);
+          res.end();
+        }
+      },
+    });
+
+    req.on('close', () => {
+      subscription.unsubscribe();
+      if (!res.writableEnded) res.end();
+    });
   }
 }

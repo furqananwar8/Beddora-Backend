@@ -36,3 +36,7 @@ export class CreateCampaignScheduleDto {
   @IsEnum(ScheduleAction)
   action!: ScheduleAction;
 }
+
+export class BulkScheduleDto {
+  schedules!: CreateCampaignScheduleDto[];
+}
