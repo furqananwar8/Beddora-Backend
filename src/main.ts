@@ -15,7 +15,6 @@ async function bootstrap() {
     .map(o => o.trim())        // ← trim whitespace just in case
     .filter(Boolean) ?? [];
 
-  console.log('CORS allowed origins:', allowedOrigins);
   app.enableCors({
     origin: (origin: string, callback: (error?: Error | null, val?: boolean | null) => void) => {
       if (!origin || allowedOrigins.includes(origin)) {

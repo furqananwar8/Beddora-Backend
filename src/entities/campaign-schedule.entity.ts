@@ -1,5 +1,5 @@
-import { Entity, PrimaryKey, Property } from '@mikro-orm/core';
-import { ScheduleAction, ScheduleStatus } from '../common/enum/campaign.enum';
+import { Entity, PrimaryKey, Property, OneToMany, Collection } from '@mikro-orm/core';
+import { ScheduleJob } from './schedule-job.entity';
 
 @Entity()
 export class CampaignSchedule {
@@ -7,32 +7,38 @@ export class CampaignSchedule {
   id!: number;
 
   @Property()
-  campaignId!: number;
+  campaignId?: string;
 
   @Property()
-  scheduleDate!: string;
+  profileId?: number;
+
+  @Property()
+  region?: string;
+
+  @Property()
+  sessionId?: string;
+
+  @Property()
+  scheduleDate?: string;
 
   @Property({ nullable: true })
   endDate?: string;
 
   @Property({ type: 'json' })
-  timeSlots!: Array<{ startTime: string; endTime: string }>;
+  timeSlots?: Array<{ startTime: string; endTime: string }>;
 
   @Property()
-  timezone!: string;
+  action?: 'ENABLED' | 'PAUSED';
 
-  @Property()
-  action!: ScheduleAction;
+  @Property({ default: true })
+  isActive?: boolean = true;
 
-  @Property({ type: 'decimal', precision: 10, scale: 2, nullable: true })
-  bidAdjustment?: number;
+  @OneToMany(() => ScheduleJob, (job) => job.schedule)
+  jobs = new Collection<ScheduleJob>(this);
 
-  @Property()
-  status!: ScheduleStatus;
+  @Property({ onCreate: () => new Date() , nullable: true })
+  createdAt?: Date = new Date();
 
-  @Property({ onCreate: () => new Date(), defaultRaw: 'now()' })
-  createdAt!: Date;
-
-  @Property({ onCreate: () => new Date(), onUpdate: () => new Date(), defaultRaw: 'now()' })
-  updatedAt!: Date;
+  @Property({ onUpdate: () => new Date() , nullable: true })
+  updatedAt?: Date = new Date();
 }

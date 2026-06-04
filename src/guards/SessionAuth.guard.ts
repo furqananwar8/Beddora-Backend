@@ -9,11 +9,18 @@ import { Request } from 'express';
 import { SESSION_COOKIE, SESSION_EXPIRED, SESSION_INVALID, SESSION_NOT_FOUND } from 'src/common/constants/session.constant';
 import { SessionService } from 'src/modules/session/service/session.service'; // adjust path
 
+export interface AmazonProfile {
+  profileId: number;
+  region: string;
+  countryCode: string;
+}
+
 export interface SessionData {
   access_token: string;
   userId: string;
   refresh_token: string;
   token_type: string;
+  profiles?: AmazonProfile[];
   expires_at: number; // unix timestamp ms
   user_id?: string;     // Amazon user ID
   oauthState?: string;

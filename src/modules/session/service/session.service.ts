@@ -1,5 +1,6 @@
 import { Injectable, Inject } from '@nestjs/common';
 import Redis from 'ioredis';
+import { AmazonProfile } from 'src/guards/SessionAuth.guard';
 import { REDIS_CLIENT } from 'src/redis/redis.provider';
 
 export interface SessionData {
@@ -10,6 +11,10 @@ export interface SessionData {
   expires_at: number; // unix timestamp ms
   user_id?: string;   // Amazon user ID (from /user/profile if needed)
   oauthState?: string;
+  profileId?: number;
+  region?: string;
+  profiles?: AmazonProfile[];
+  countryCode?: string;
 }
 
 @Injectable()
@@ -31,9 +36,9 @@ export class SessionService  {
     return JSON.parse(raw) as SessionData;
   }
 
-  async update(sessionId: string, data: Partial<SessionData>, ttlSeconds: number): Promise<void> {
+  async update(sessionId: string, data: Partial<SessionData>, ttlSeconds: number): Promise<void | null> {
     const existing = await this.get(sessionId);
-    if (!existing) throw new Error('Session not found');
+    if (!existing) return null;
     await this.create(sessionId, { ...existing, ...data }, ttlSeconds);
   }
 

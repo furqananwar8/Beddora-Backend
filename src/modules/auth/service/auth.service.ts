@@ -26,7 +26,7 @@ export class AuthService {
  async exchangeCodeForTokens(
   code: string,
   existingSessionId: string,
-): Promise<{ sessionId: string; expiresIn: number }> {
+): Promise<{ sessionId: string; expiresIn: number, access_token: string }> {
     // Exchange code for tokens
     const tokenRes = await fetch('https://api.amazon.com/auth/o2/token', {
       method: 'POST',
@@ -87,7 +87,7 @@ export class AuthService {
 
     await this.sessionService.update(existingSessionId, sessionData, tokenData.expires_in - 60);
 
-    return { sessionId: existingSessionId, expiresIn: tokenData.expires_in };
+    return { sessionId: existingSessionId, expiresIn: tokenData.expires_in, access_token: tokenData.access_token, };
   }
 
 

@@ -1,44 +1,286 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, HttpException, Logger } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
-import { AmazonSPCampaignResponse } from '../amazon-api.service';
+import { AxiosError } from 'axios';
+import { ConfigService } from '@nestjs/config';
+import { AmazonProfile } from 'src/guards/SessionAuth.guard';
+import { decodeCursor, encodeCursor } from 'src/utils/amazon-pagination-cursor';
+
+interface QueryCampaignsForProfileOptions {
+  accessToken: string;
+  profile: AmazonProfile;
+  type: AmazonAdProduct;
+  maxResults: number;
+  state?: string;
+  nextToken?: string;
+}
+
+export interface QueryCampaignsOptions {
+  accessToken: string;
+  profiles: AmazonProfile[];
+  type: AmazonAdProduct;
+  page?: number | null;
+  limit?: number;
+  search?: string;
+  state?: string;
+}
+
+export type AmazonAdProduct = 
+  | 'SPONSORED_PRODUCTS' 
+  | 'SPONSORED_BRANDS' 
+  | 'SPONSORED_DISPLAY';
+
+export type AmazonRegion = 'na' | 'eu' | 'fe';
+
+export interface QueryCampaignsOptions {
+  accessToken: string;
+  profileId: number;
+  region?: AmazonRegion;
+  type: AmazonAdProduct;
+  page?: number | null;
+  limit?: number;
+  search?: string;
+  state?: string;
+}
+
+export interface CampaignListResult {
+  data: any[];
+  meta: {
+    total: number;
+    page: number | null;
+    limit: number;
+    totalPages?: number;
+    hasNextPage: boolean;
+    nextCursor: string | null;
+  };
+}
+
+export type AmazonCampaignState =
+  | 'ENABLED'
+  | 'PAUSED'
+  | 'ARCHIVED';
+
+export interface QueryCampaignsOptions {
+  nextToken?: string;
+  maxResults?: number;
+  stateFilter?: AmazonCampaignState | AmazonCampaignState[];
+  adProducts?: AmazonAdProduct[];
+  campaignIds?: string[];
+  portfolioIds?: string[];
+  nameFilter?: string[];
+}
+
+export interface AmazonCampaign {
+  campaignId: string;
+  name: string;
+  state: AmazonCampaignState;
+  adProduct: AmazonAdProduct;
+  portfolioId?: string;
+  creationDateTime?: string;
+  // extend as needed
+}
+
+export interface AmazonSPCampaignResponse {
+  campaigns: AmazonCampaign[];
+  nextToken?: string;
+}
 
 
 @Injectable()
 export class AmazonCampaignApiClient {
-  private readonly baseUrl: string =
-    process.env.AMAZON_API_BASE_URL || 'http://localhost:3000/amazon';
+  private readonly baseUrls = {
+    na: 'https://advertising-api.amazon.com',
+    eu: 'https://advertising-api-eu.amazon.com',
+    fe: 'https://advertising-api-fe.amazon.com',
+  };
 
-  constructor(private readonly httpService: HttpService) {}
+  private readonly logger = new Logger(AmazonCampaignApiClient.name);
 
-  async getSPCampaignsPage(
-    profileId: number,
-    nextToken?: string,
-    count: number = 100,
-  ): Promise<AmazonSPCampaignResponse> {
-    const params: Record<string, any> = { profileId, count };
-    if (nextToken) params.nextToken = nextToken;
+  constructor(private readonly httpService: HttpService, private readonly configService: ConfigService) {
+    this.httpService.axiosRef.interceptors.request.use((config) => {
+      this.logger.debug('HTTP REQUEST', JSON.stringify({
+        method: config.method?.toUpperCase(),
+        url: config.url,
+        headers: config.headers,
+        body: config.data,
+      }, null, 2));
+      return config;
+    });
+  }
 
-    const { data }: { data: any } = await firstValueFrom(
-      this.httpService.get<AmazonSPCampaignResponse>(
-        `${this.baseUrl}/v2/sp/campaigns`,
-        { params },
+  private getBaseUrl(region: 'na' | 'eu' | 'fe' = 'na') {
+    return this.baseUrls[region];
+  }
+
+  async getProfiles(accessToken: string, region: 'na' | 'eu' | 'fe' = 'na') {
+    try {
+      const { data } = await firstValueFrom(
+        this.httpService.get(`${this.getBaseUrl(region)}/profiles`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }),
+      );
+      return data as Array<{
+        profileId: number;
+        countryCode: string;
+        currencyCode: string;
+        timezone: string;
+        accountInfo: { id: string; type: string; name?: string };
+      }>;
+    } catch (err) {
+      const error = err as AxiosError;
+      throw new HttpException(error.response?.data || 'Profile fetch failed', error.response?.status || 500);
+    }
+  }
+
+//Currently in use
+ async queryCampaignsForProfile(
+  options: QueryCampaignsForProfileOptions,
+): Promise<{ campaigns: any[]; nextToken: string | null | undefined }> {
+  const { accessToken, profile, type, maxResults, state, nextToken } = options;
+
+  const clientId = this.configService.getOrThrow('AMAZON_CLIENT_ID');
+  const campaigns: any[] = [];
+  let token = nextToken;
+  let hasMore = true;
+
+  while (campaigns.length < maxResults && hasMore) {
+    const body: any = {
+      maxResults: Math.min(500, maxResults - campaigns.length),
+      adProductFilter: { include: [type] },
+    };
+    if (state) body.stateFilter = { include: [state.toUpperCase()] };
+    if (token) body.nextToken = token;
+
+    const { data } = await firstValueFrom(
+      this.httpService.post(
+        `${this.getBaseUrl(profile.region as AmazonRegion)}/adsApi/v1/query/campaigns`,
+        body,
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken.trim()}`,
+            'Amazon-Ads-ClientId': String(clientId),
+            'Amazon-Advertising-API-Scope': String(profile.profileId),
+            'Content-Type': 'application/json',
+          },
+        },
       ),
     );
 
-    return data;
+    const pageCampaigns = data?.campaigns || [];
+    campaigns.push(...pageCampaigns);
+
+    token = data?.nextToken || null;
+    hasMore = !!token && pageCampaigns.length > 0;
   }
 
-  async getAllSPCampaigns(profileId: number): Promise<AmazonSPCampaignResponse['campaigns']> {
-    const allCampaigns: AmazonSPCampaignResponse['campaigns'] = [];
-    let nextToken: string | undefined;
+  return { campaigns, nextToken: token };
+}
 
-    do {
-      const page = await this.getSPCampaignsPage(profileId, nextToken, 100);
-      allCampaigns.push(...page.campaigns);
-      nextToken = page.nextToken;
-    } while (nextToken);
 
-    return allCampaigns;
+async queryCampaignsByType(
+  options: QueryCampaignsOptions & { cursor?: string | null }
+): Promise<CampaignListResult> {
+  const { accessToken, profiles, type, limit = 15, search, state, cursor } = options;
+
+  // Decode cursor — keys are STRINGS because JSON
+  const cursors: Record<string, string | null> = cursor ? decodeCursor(cursor) : {};
+   const perProfileLimit = search ? 500 : Math.ceil(limit / profiles.length);
+  console.log({cursors})
+  // Fetch from ALL profiles in parallel
+  const results = await Promise.all(
+    profiles.map(async (profile) => {
+      // BUG FIX: Use String(profileId) as key
+      const profileToken = cursors[String(profile.profileId)] || undefined;
+      console.log({profile, profileToken})
+      const { campaigns, nextToken } = await this.queryCampaignsForProfile({
+        accessToken,
+        profile,
+        type,
+        maxResults: perProfileLimit,
+        state,
+        nextToken: profileToken,
+      });
+      console.log({campaigns})
+      return {
+        profileId: profile.profileId,
+        countryCode: profile.countryCode,
+        campaigns,
+        nextToken,
+      };
+    }),
+  );
+
+  // Merge all accounts
+  let campaigns = results.flatMap((r) =>
+    r.campaigns.map((c: any) => ({
+      ...c,
+      countryCode: r.countryCode,
+      profileId: r.profileId,
+    }))
+  );
+
+  // Sort newest first
+  campaigns.sort((a, b) => Date.parse(b.creationDateTime) - Date.parse(a.creationDateTime));
+
+  // Search filter
+  if (search) {
+    const term = search.toUpperCase().trim();
+    campaigns = campaigns.filter((c) => {
+      const nameMatch = c.name?.toUpperCase().includes(term);
+      const idMatch = c.campaignId?.toUpperCase().includes(term);
+      const skuMatch = c.tags?.some((t: string) => t.toUpperCase().includes(term));
+      return nameMatch || idMatch || skuMatch;
+    });
   }
+
+  // Build next cursor from profiles that still have more data
+  const nextCursors: Record<string, string | null> = {};
+  let hasNext = false;
+  for (const r of results) {
+    if (r.nextToken) {
+      nextCursors[String(r.profileId)] = r.nextToken;
+      hasNext = true;
+    }
+  }
+
+  return {
+    data: campaigns,
+    meta: {
+      total: campaigns.length,
+      page: null,
+      limit,
+      hasNextPage: hasNext,
+      nextCursor: hasNext ? encodeCursor(nextCursors) : null,
+    },
+  };
+}
+
+
+  // async updateCampaign(
+  //   accessToken: string,
+  //   profileId: number,
+  //   region: 'na' | 'eu' | 'fe',
+  //   campaignId: string,
+  //   payload: { state?: string; bidding?: any },
+  // ) {
+  //   try {
+  //     const { data } = await firstValueFrom(
+  //       this.httpService.patch(
+  //         `${this.getBaseUrl(region)}/sp/campaigns/${campaignId}`,
+  //         payload,
+  //         {
+  //           headers: {
+  //             Authorization: `Bearer ${accessToken}`,
+  //             'Amazon-Advertising-API-Scope': String(profileId),
+  //             'Content-Type': 'application/json',
+  //           },
+  //         },
+  //       ),
+  //     );
+  //     return data;
+  //   } catch (err) {
+  //     const error = err as AxiosError;
+  //     throw new HttpException(error.response?.data || 'Campaign update failed', error.response?.status || 500);
+  //   }
+  // }
 }
