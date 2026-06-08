@@ -30,6 +30,7 @@ import { ScheduleExpanderService } from '../service/schedule-expander.service';
 import { SESSION_COOKIE } from 'src/common/constants/session.constant';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
+import { CreateSchedulesDTO } from '../dto/create-schedules.dto';
 
 @ApiTags('Campaigns')
 @Controller('campaigns')
@@ -95,7 +96,6 @@ async listCampaigns(
   const em = this.em.fork();
   const schedules = await em.find(CampaignSchedule, {
     profileId: { $in: allProfileIds },
-    isActive: true,
     campaignId: { $in: campaigns.map((c) => String(c.campaignId)) },
   });
 
@@ -118,12 +118,12 @@ async listCampaigns(
   @Post(':campaignId/schedule')
   @UseGuards(SessionAuthGuard)
   @ApiCookieAuth('sid')
-  @ApiOperation({ summary: 'Create day-parting schedules' })
+  @ApiOperation({ summary: 'Create day-parting schedules (diff-based)' })
   @ApiBody({
     schema: {
       example: {
         schedules: [
-          { scheduleDate: '20260602', timeSlots: [{ startTime: '01:31', endTime: '02:20' }], action: 'ENABLED' },
+          { scheduleDate: '20260609', timeSlots: [{ startTime: '18:00', endTime: '19:00' }], action: 'ENABLED' },
         ],
       },
     },
@@ -131,14 +131,7 @@ async listCampaigns(
   async createSchedule(
     @Param('campaignId') campaignId: string,
     @Req() req: Request,
-    @Body() body: {
-      schedules: Array<{
-        scheduleDate: string;
-        endDate?: string;
-        timeSlots: Array<{ startTime: string; endTime: string }>;
-        action: 'ENABLED' | 'PAUSED';
-      }>;
-    },
+    @Body() body: CreateSchedulesDTO,
   ) {
     if (!body.schedules?.length) {
       throw new BadRequestException('schedules array is required');
@@ -151,7 +144,7 @@ async listCampaigns(
       throw new BadRequestException('No Amazon Advertising profile linked to session');
     }
 
-    const result = await this.expander.expandAndQueue(
+    const result = await this.expander.syncSchedules(
       campaignId,
       session.profileId as number,
       (session.region as string) || 'na',
@@ -159,7 +152,11 @@ async listCampaigns(
       body.schedules,
     );
 
-    return { message: 'Schedules created', campaignId, ...result };
+    return { 
+      message: 'Schedules synced', 
+      campaignId, 
+      ...result 
+    };
   }
 
   @Get(':campaignId/jobs')

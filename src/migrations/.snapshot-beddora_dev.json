@@ -468,19 +468,19 @@
         },
         "profile_id": {
           "name": "profile_id",
-          "type": "int4",
+          "type": "int8",
           "unsigned": false,
           "autoincrement": false,
           "primary": false,
           "nullable": false,
           "unique": false,
           "length": null,
-          "precision": 32,
+          "precision": 64,
           "scale": 0,
           "default": null,
           "comment": null,
           "enumItems": [],
-          "mappedType": "integer"
+          "mappedType": "bigint"
         },
         "region": {
           "name": "region",
@@ -698,19 +698,19 @@
         },
         "profile_id": {
           "name": "profile_id",
-          "type": "int4",
+          "type": "int8",
           "unsigned": false,
           "autoincrement": false,
           "primary": false,
           "nullable": false,
           "unique": false,
           "length": null,
-          "precision": 32,
+          "precision": 64,
           "scale": 0,
           "default": null,
           "comment": null,
           "enumItems": [],
-          "mappedType": "integer"
+          "mappedType": "bigint"
         },
         "region": {
           "name": "region",

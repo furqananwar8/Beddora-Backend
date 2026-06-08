@@ -5,6 +5,25 @@ import { ScheduleJob } from 'src/entities/schedule-job.entity';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 
+interface TimeSlot {
+  startTime: string;
+  endTime: string;
+}
+
+interface ScheduleConfig {
+  scheduleDate: string;
+  endDate?: string;
+  timeSlots: TimeSlot[];
+  action: 'ENABLED' | 'PAUSED';
+}
+
+interface SyncResult {
+  schedulesCreated: number;
+  schedulesRemoved: number;
+  jobsCreated: number;
+  jobsCancelled: number;
+}
+
 @Injectable()
 export class ScheduleExpanderService {
   constructor(
@@ -12,23 +31,128 @@ export class ScheduleExpanderService {
     @InjectQueue('campaign-scheduler') private readonly schedulerQueue: Queue,
   ) {}
 
-  async expandAndQueue(
+  async syncSchedules(
     campaignId: string,
     profileId: number,
     region: string,
     sessionId: string,
-    schedules: Array<{
-      scheduleDate: string;
-      endDate?: string;
-      timeSlots: Array<{ startTime: string; endTime: string }>;
-      action: 'ENABLED' | 'PAUSED';
-    }>,
-  ): Promise<{ schedulesCreated: number; jobsCreated: number }> {
+    incoming: ScheduleConfig[],
+  ): Promise<SyncResult> {
     const em = this.em.fork();
-    let totalJobs = 0;
-    const jobsToQueue: Array<{ job: ScheduleJob; delay: number }> = [];
+    const existing = await this.fetchActive(em, campaignId);
 
-    for (const cfg of schedules) {
+    const incomingKeys = this.keySet(incoming);
+    const { keep, cancel } = this.partition(existing, incomingKeys);
+
+    const cancelled = await this.cancel(em, cancel);
+    const create = this.extractNew(incoming, keep);
+    console.log({cancelled})
+    console.log({create})
+    const created = await this.create(em, campaignId, profileId, region, sessionId, create);
+
+    await em.flush();
+
+    return {
+      schedulesCreated: create.length,
+      schedulesRemoved: cancel.length,
+      jobsCreated: created,
+      jobsCancelled: cancelled,
+    };
+  }
+
+  private async fetchActive(em: EntityManager, campaignId: string): Promise<CampaignSchedule[]> {
+    return em.find(CampaignSchedule, { campaignId, isActive: true });
+  }
+
+  private keySet(configs: ScheduleConfig[]): Set<string> {
+    const keys = new Set<string>();
+    for (const cfg of configs) {
+      for (const slot of cfg.timeSlots) {
+        keys.add(`${cfg.scheduleDate}|${slot.startTime}|${slot.endTime}`);
+      }
+    }
+    return keys;
+  }
+
+  private partition(
+    existing: CampaignSchedule[],
+    incomingKeys: Set<string>,
+  ): { keep: CampaignSchedule[]; cancel: CampaignSchedule[] } {
+    const keep: CampaignSchedule[] = [];
+    const cancel: CampaignSchedule[] = [];
+
+    for (const schedule of existing) {
+      const matches = (schedule.timeSlots ?? []).some(slot =>
+        incomingKeys.has(`${schedule.scheduleDate}|${slot.startTime}|${slot.endTime}`),
+      );
+      (matches ? keep : cancel).push(schedule);
+    }
+
+    return { keep, cancel };
+  }
+
+  private extractNew(incoming: ScheduleConfig[], keep: CampaignSchedule[]): ScheduleConfig[] {
+    const keepKeys = new Set(
+      keep.flatMap(s => (s.timeSlots ?? []).map(slot => `${s.scheduleDate}|${slot.startTime}|${slot.endTime}`)),
+    );
+
+    const out: ScheduleConfig[] = [];
+    for (const cfg of incoming) {
+      for (const slot of cfg.timeSlots) {
+        const key = `${cfg.scheduleDate}|${slot.startTime}|${slot.endTime}`;
+        if (!keepKeys.has(key)) {
+          out.push({ ...cfg, timeSlots: [slot] });
+        }
+      }
+    }
+    return out;
+  }
+
+  private async cancel(em: EntityManager, schedules: CampaignSchedule[]): Promise<number> {
+    let count = 0;
+    for (const schedule of schedules) {
+      const jobs = await em.find(ScheduleJob, { schedule, status: 'pending' });
+      for (const job of jobs) {
+        try {
+          await this.schedulerQueue.remove(`schedule-${job.id}`);
+        } catch { /* noop */ }
+        job.status = 'cancelled';
+        count++;
+      }
+      schedule.isActive = false;
+      schedule.updatedAt = new Date();
+    }
+    return count;
+  }
+
+  private async create(
+    em: EntityManager,
+    campaignId: string,
+    profileId: number,
+    region: string,
+    sessionId: string,
+    configs: ScheduleConfig[],
+  ): Promise<number> {
+    if (configs.length === 0) return 0;
+
+    const jobs = this.buildJobs(em, campaignId, profileId, region, sessionId, configs);
+    await em.flush();
+    await this.enqueue(jobs);
+
+    return jobs.length;
+  }
+
+  private buildJobs(
+    em: EntityManager,
+    campaignId: string,
+    profileId: number,
+    region: string,
+    sessionId: string,
+    configs: ScheduleConfig[],
+  ): Array<{ job: ScheduleJob; delay: number }> {
+    const out: Array<{ job: ScheduleJob; delay: number }> = [];
+
+    for (const cfg of configs) {
       const schedule = em.create(CampaignSchedule, {
         campaignId,
         profileId,
@@ -38,91 +162,92 @@ export class ScheduleExpanderService {
         endDate: cfg.endDate,
         timeSlots: cfg.timeSlots,
         action: cfg.action,
+        isActive: true,
       });
       em.persist(schedule);
 
-      const start = this.parseYmd(cfg.scheduleDate);
-      const end = cfg.endDate ? this.parseYmd(cfg.endDate) : new Date(start);
-      const dates: Date[] = [];
-
-      for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-        dates.push(new Date(d));
-      }
+      const dates = this.dateRange(cfg.scheduleDate, cfg.endDate);
+      const { startAction, endAction } = this.resolveActions(cfg.action);
 
       for (const date of dates) {
         for (const slot of cfg.timeSlots) {
-          const startAt = this.combineDateTime(date, slot.startTime);
-          let endAt = this.combineDateTime(date, slot.endTime);
+          const { startAt, endAt } = this.executionWindow(date, slot);
 
-          if (endAt <= startAt) {
-            endAt.setDate(endAt.getDate() + 1);
-          }
-
-          const { startAction, endAction } = this.resolveActions(cfg.action);
-
-          const startJob = em.create(ScheduleJob, {
-            schedule,
-            campaignId,
-            profileId,
-            region,
-            executeAt: startAt,
-            jobType: 'slot_start',
-            action: startAction,
-          });
-          em.persist(startJob);
-          totalJobs++;
-          jobsToQueue.push({ job: startJob, delay: startAt.getTime() - Date.now() });
-
-          const endJob = em.create(ScheduleJob, {
-            schedule,
-            campaignId,
-            profileId,
-            region,
-            executeAt: endAt,
-            jobType: 'slot_end',
-            action: endAction,
-          });
-          em.persist(endJob);
-          totalJobs++;
-          jobsToQueue.push({ job: endJob, delay: endAt.getTime() - Date.now() });
+          out.push(
+            { job: this.makeJob(em, schedule, campaignId, profileId, region, startAt, 'slot_start', startAction), delay: startAt.getTime() - Date.now() },
+            { job: this.makeJob(em, schedule, campaignId, profileId, region, endAt, 'slot_end', endAction), delay: endAt.getTime() - Date.now() },
+          );
         }
       }
     }
 
-    await em.flush();
+    return out;
+  }
 
-    for (const item of jobsToQueue) {
-        const executeAt = item.job.executeAt;
-        if (!executeAt) continue; // type guard — satisfies TS
-        const delay = executeAt.getTime() - Date.now();
-        if (delay > 0) {
-            await this.schedulerQueue.add(
-            'execute',
-            { jobId: item.job.id },
-            { delay, jobId: `schedule-${item.job.id}` },
-            );
-        }
+  private makeJob(
+    em: EntityManager,
+    schedule: CampaignSchedule,
+    campaignId: string,
+    profileId: number,
+    region: string,
+    executeAt: Date,
+    jobType: 'slot_start' | 'slot_end',
+    action: 'ENABLE' | 'PAUSE',
+  ): ScheduleJob {
+    const job = em.create(ScheduleJob, {
+      schedule,
+      campaignId,
+      profileId,
+      region,
+      executeAt,
+      jobType,
+      action,
+      status: 'pending',
+    });
+    em.persist(job);
+    return job;
+  }
+
+  private async enqueue(items: Array<{ job: ScheduleJob; delay: number }>): Promise<void> {
+    for (const { job, delay } of items) {
+      if (!job.executeAt || delay <= 0) continue;
+      await this.schedulerQueue.add('execute', { jobId: job.id }, { delay, jobId: `schedule-${job.id}` });
     }
-
-    return { schedulesCreated: schedules.length, jobsCreated: totalJobs };
   }
 
-  private parseYmd(str: string): Date {
-    const y = parseInt(str.slice(0, 4), 10);
-    const m = parseInt(str.slice(4, 6), 10) - 1;
-    const d = parseInt(str.slice(6, 8), 10);
-    return new Date(Date.UTC(y, m, d));
+  private dateRange(startYmd: string, endYmd?: string): Date[] {
+    const start = this.parseYmd(startYmd);
+    const end = endYmd ? this.parseYmd(endYmd) : new Date(start);
+    const dates: Date[] = [];
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      dates.push(new Date(d));
+    }
+    return dates;
   }
 
-  private combineDateTime(date: Date, time: string): Date {
+  private executionWindow(date: Date, slot: TimeSlot): { startAt: Date; endAt: Date } {
+    const startAt = this.toUtc(date, slot.startTime);
+    const endAt = this.toUtc(date, slot.endTime);
+    if (endAt <= startAt) endAt.setDate(endAt.getDate() + 1);
+    return { startAt, endAt };
+  }
+
+  private toUtc(date: Date, time: string): Date {
     const [h, min] = time.split(':').map(Number);
     return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), h, min));
   }
 
+  private parseYmd(str: string): Date {
+    return new Date(Date.UTC(
+      parseInt(str.slice(0, 4), 10),
+      parseInt(str.slice(4, 6), 10) - 1,
+      parseInt(str.slice(6, 8), 10),
+    ));
+  }
+
   private resolveActions(userAction: 'ENABLED' | 'PAUSED') {
-    if (userAction === 'ENABLED') {
-      return { startAction: 'ENABLE' as const, endAction: 'PAUSE' as const };
-    }
-    return { startAction: 'PAUSE' as const, endAction: 'ENABLE' as const };
+    return userAction === 'ENABLED'
+      ? { startAction: 'ENABLE' as const, endAction: 'PAUSE' as const }
+      : { startAction: 'PAUSE' as const, endAction: 'ENABLE' as const };
   }
 }

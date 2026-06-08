@@ -33,6 +33,13 @@ export class CampaignSchedulerWorker extends WorkerHost {
       throw new Error('Schedule relation not loaded');
     }
 
+    if (schedule.isActive === false) {
+      console.log(`Job ${job.data.jobId} skipped: parent schedule isActive=false`);
+      scheduleJob.status = 'cancelled';
+      await em.flush();
+      return;
+    }
+
     try {
       const session = await this.sessionService.get(schedule.sessionId || '');
       if (!session?.access_token) {
@@ -40,6 +47,7 @@ export class CampaignSchedulerWorker extends WorkerHost {
       }
 
       if (scheduleJob.action === 'ENABLE') {
+        // TODO: Uncomment when ready to hit Amazon API
         // await this.amazonClient.updateCampaign(
         //   session.access_token,
         //   scheduleJob.profileId as number,
@@ -47,7 +55,9 @@ export class CampaignSchedulerWorker extends WorkerHost {
         //   scheduleJob.campaignId as string,
         //   { state: 'enabled' },
         // );
+        console.log(`[WORKER] Would ENABLE campaign ${scheduleJob.campaignId} at ${new Date().toISOString()}`);
       } else if (scheduleJob.action === 'PAUSE') {
+        // TODO: Uncomment when ready to hit Amazon API
         // await this.amazonClient.updateCampaign(
         //   session.access_token,
         //   scheduleJob.profileId as number,
@@ -55,6 +65,7 @@ export class CampaignSchedulerWorker extends WorkerHost {
         //   scheduleJob.campaignId as string,
         //   { state: 'paused' },
         // );
+        console.log(`[WORKER] Would PAUSE campaign ${scheduleJob.campaignId} at ${new Date().toISOString()}`);
       }
 
       scheduleJob.status = 'completed';

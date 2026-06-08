@@ -12,8 +12,8 @@ export class ScheduleJob {
   @Property()
   campaignId?: string;
 
-  @Property()
-  profileId?: number;
+  @Property({ type: 'bigint' })
+  profileId!: number; // or number
 
   @Property()
   region?: string;

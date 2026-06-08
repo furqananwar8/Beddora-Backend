@@ -9,8 +9,8 @@ export class CampaignSchedule {
   @Property()
   campaignId?: string;
 
-  @Property()
-  profileId?: number;
+  @Property({ type: 'bigint' })
+  profileId!: number;
 
   @Property()
   region?: string;
