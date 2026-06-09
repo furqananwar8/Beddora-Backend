@@ -46,27 +46,25 @@ export class CampaignSchedulerWorker extends WorkerHost {
         throw new Error('No valid Amazon token');
       }
 
-      if (scheduleJob.action === 'ENABLE') {
-        // TODO: Uncomment when ready to hit Amazon API
-        // await this.amazonClient.updateCampaign(
-        //   session.access_token,
-        //   scheduleJob.profileId as number,
-        //   scheduleJob.region as 'na' | 'eu' | 'fe',
-        //   scheduleJob.campaignId as string,
-        //   { state: 'enabled' },
-        // );
-        console.log(`[WORKER] Would ENABLE campaign ${scheduleJob.campaignId} at ${new Date().toISOString()}`);
-      } else if (scheduleJob.action === 'PAUSE') {
-        // TODO: Uncomment when ready to hit Amazon API
-        // await this.amazonClient.updateCampaign(
-        //   session.access_token,
-        //   scheduleJob.profileId as number,
-        //   scheduleJob.region as 'na' | 'eu' | 'fe',
-        //   scheduleJob.campaignId as string,
-        //   { state: 'paused' },
-        // );
-        console.log(`[WORKER] Would PAUSE campaign ${scheduleJob.campaignId} at ${new Date().toISOString()}`);
-      }
+    if (scheduleJob.action === 'ENABLE') {
+      await this.amazonClient.updateCampaign(
+        session.access_token,
+        scheduleJob.profileId as number,
+        scheduleJob.region as 'na' | 'eu' | 'fe',
+        scheduleJob.campaignId as string,
+        { state: 'ENABLED' }, // ← UPPERCASE per Amazon docs
+      );
+      console.log(`[WORKER] ENABLED campaign ${scheduleJob.campaignId} at ${new Date().toISOString()}`);
+    } else if (scheduleJob.action === 'PAUSE') {
+      await this.amazonClient.updateCampaign(
+        session.access_token,
+        scheduleJob.profileId as number,
+        scheduleJob.region as 'na' | 'eu' | 'fe',
+        scheduleJob.campaignId as string,
+        { state: 'PAUSED' }, // ← UPPERCASE per Amazon docs
+      );
+      console.log(`[WORKER] PAUSED campaign ${scheduleJob.campaignId} at ${new Date().toISOString()}`);
+    }
 
       scheduleJob.status = 'completed';
       scheduleJob.completedAt = new Date();

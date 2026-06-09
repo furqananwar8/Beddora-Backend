@@ -256,31 +256,44 @@ async queryCampaignsByType(
 }
 
 
-  // async updateCampaign(
-  //   accessToken: string,
-  //   profileId: number,
-  //   region: 'na' | 'eu' | 'fe',
-  //   campaignId: string,
-  //   payload: { state?: string; bidding?: any },
-  // ) {
-  //   try {
-  //     const { data } = await firstValueFrom(
-  //       this.httpService.patch(
-  //         `${this.getBaseUrl(region)}/sp/campaigns/${campaignId}`,
-  //         payload,
-  //         {
-  //           headers: {
-  //             Authorization: `Bearer ${accessToken}`,
-  //             'Amazon-Advertising-API-Scope': String(profileId),
-  //             'Content-Type': 'application/json',
-  //           },
-  //         },
-  //       ),
-  //     );
-  //     return data;
-  //   } catch (err) {
-  //     const error = err as AxiosError;
-  //     throw new HttpException(error.response?.data || 'Campaign update failed', error.response?.status || 500);
-  //   }
-  // }
+ async updateCampaign(
+  accessToken: string,
+  profileId: number,
+  region: 'na' | 'eu' | 'fe',
+  campaignId: string,
+  payload: { state?: string; bidding?: any; name?: string; startDateTime?: string; endDateTime?: string; portfolioId?: string | null },
+) {
+  try {
+    const clientId = this.configService.getOrThrow('AMAZON_CLIENT_ID');
+
+    const { data } = await firstValueFrom(
+      this.httpService.post(
+        `${this.getBaseUrl(region)}/adsApi/v1/update/campaigns`,
+        {
+          campaigns: [
+            {
+              campaignId,
+              ...payload,
+            },
+          ],
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Amazon-Ads-ClientId': String(clientId),
+            'Amazon-Advertising-API-Scope': String(profileId),
+            'Content-Type': 'application/json',
+          },
+        },
+      ),
+    );
+    return data;
+  } catch (err) {
+    const error = err as AxiosError;
+    throw new HttpException(
+      error.response?.data || 'Campaign update failed',
+      error.response?.status || 500,
+    );
+  }
+}
 }

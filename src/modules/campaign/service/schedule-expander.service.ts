@@ -210,7 +210,15 @@ export class ScheduleExpanderService {
     for (const { job, delay } of items) {
       if (!job.executeAt) continue;
       const safeDelay = Math.max(0, delay);
-      await this.schedulerQueue.add('execute', { jobId: job.id }, { delay: safeDelay, jobId: `schedule-${job.id}` });
+      await this.schedulerQueue.add('execute', { jobId: job.id }, {
+        delay: safeDelay,
+        jobId: `schedule-${job.id}`,
+        attempts: 3,                    // ← retry 3 times
+        backoff: {
+          type: 'exponential',
+          delay: 60000,               // ← 1 min, 2 min, 4 min
+        },
+      });
     }
   }
 

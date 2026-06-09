@@ -209,6 +209,7 @@ async listCampaigns(
         } catch {
           // ignore if already processed or missing
         }
+        job.status = 'cancelled'; // ← ADD THIS
       }
     }
 
