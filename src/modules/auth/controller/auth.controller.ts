@@ -28,6 +28,7 @@ import { firstValueFrom } from 'rxjs';
 @ApiTags('Auth')
 @Controller('auth')
 export class AuthController {
+  private readonly isProd: boolean = false;
   constructor(
     private em: EntityManager, 
     private authService: AuthService, 
@@ -35,7 +36,9 @@ export class AuthController {
     @InjectQueue(AMAZON_TOKEN_REFRESH) private readonly tokenRefreshQueue: Queue,
     private readonly configService: ConfigService,
     private readonly httpService: HttpService
-  ) {}
+  ) {
+     this.isProd = process.env.NODE_ENV === 'production';
+  }
   
   @Get('amazon/login')
   @ApiOperation({ summary: 'Initiate Amazon OAuth login' })
@@ -62,8 +65,8 @@ export class AuthController {
         // Clear the bad cookie immediately
         res.clearCookie(SESSION_COOKIE, {
           path: '/',
-          sameSite: 'none',
-          secure: true,
+          sameSite: this.isProd ? 'none' : 'lax',
+          secure: this.isProd,
           httpOnly: true,
         });
         sessionId = null; // Force new session creation below
@@ -86,10 +89,12 @@ export class AuthController {
         300,
       );
 
+     
+
       res.cookie(SESSION_COOKIE, newSessionId, {
         httpOnly: true,
-        sameSite: 'none',
-        secure: true,
+        sameSite: this.isProd ? 'none' : 'lax',
+        secure: this.isProd,
         path: '/',
         maxAge: 300 * 1000,
       });
