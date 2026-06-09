@@ -46,8 +46,6 @@ export class ScheduleExpanderService {
 
     const cancelled = await this.cancel(em, cancel);
     const create = this.extractNew(incoming, keep);
-    console.log({cancelled})
-    console.log({create})
     const created = await this.create(em, campaignId, profileId, region, sessionId, create);
 
     await em.flush();
@@ -210,8 +208,9 @@ export class ScheduleExpanderService {
 
   private async enqueue(items: Array<{ job: ScheduleJob; delay: number }>): Promise<void> {
     for (const { job, delay } of items) {
-      if (!job.executeAt || delay <= 0) continue;
-      await this.schedulerQueue.add('execute', { jobId: job.id }, { delay, jobId: `schedule-${job.id}` });
+      if (!job.executeAt) continue;
+      const safeDelay = Math.max(0, delay);
+      await this.schedulerQueue.add('execute', { jobId: job.id }, { delay: safeDelay, jobId: `schedule-${job.id}` });
     }
   }
 
@@ -226,23 +225,34 @@ export class ScheduleExpanderService {
   }
 
   private executionWindow(date: Date, slot: TimeSlot): { startAt: Date; endAt: Date } {
-    const startAt = this.toUtc(date, slot.startTime);
-    const endAt = this.toUtc(date, slot.endTime);
-    if (endAt <= startAt) endAt.setDate(endAt.getDate() + 1);
+    const startAt = this.toLocalDate(date, slot.startTime);
+    const endAt = this.toLocalDate(date, slot.endTime);
+    if (endAt <= startAt) {
+      endAt.setDate(endAt.getDate() + 1);
+    }
     return { startAt, endAt };
   }
 
-  private toUtc(date: Date, time: string): Date {
+  // PST local time — no UTC conversion
+  private toLocalDate(date: Date, time: string): Date {
     const [h, min] = time.split(':').map(Number);
-    return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), h, min));
+    return new Date(
+      date.getFullYear(),
+      date.getMonth(),
+      date.getDate(),
+      h,
+      min,
+      0,
+      0,
+    );
   }
 
   private parseYmd(str: string): Date {
-    return new Date(Date.UTC(
+    return new Date(
       parseInt(str.slice(0, 4), 10),
       parseInt(str.slice(4, 6), 10) - 1,
       parseInt(str.slice(6, 8), 10),
-    ));
+    );
   }
 
   private resolveActions(userAction: 'ENABLED' | 'PAUSED') {
