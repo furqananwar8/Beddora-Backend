@@ -1,35 +1,31 @@
-// src/modules/campaign-scheduler/dto/create-schedules.dto.ts
-import { IsArray, IsString, IsOptional, ValidateNested } from 'class-validator';
+// create-schedules.dto.ts
+import { IsArray, IsString, IsIn, ValidateNested, IsOptional } from 'class-validator';
 import { Type } from 'class-transformer';
 
-class TimeSlotDTO {
+class TimeSlotDto {
   @IsString()
   startTime!: string; // "HH:mm"
 
   @IsString()
-  endTime!: string; // "HH:mm"
+  endTime!: string;   // "HH:mm"
 }
 
-export class ScheduleConfigDTO {
-  @IsString()
-  scheduleDate!: string; // "yyyyMMdd"
-
-  @IsOptional()
-  @IsString()
-  endDate?: string; // "yyyyMMdd" - for multi-day ranges
+export class ScheduleConfigDto {
+  @IsIn([0, 1, 2, 3, 4, 5, 6])
+  dayOfWeek!: number; // 0=Sun, 1=Mon, ..., 6=Sat
 
   @IsArray()
   @ValidateNested({ each: true })
-  @Type(() => TimeSlotDTO)
-  timeSlots!: TimeSlotDTO[];
+  @Type(() => TimeSlotDto)
+  timeSlots!: TimeSlotDto[];
 
-  @IsString()
+  @IsIn(['ENABLED', 'PAUSED'])
   action!: 'ENABLED' | 'PAUSED';
 }
 
 export class CreateSchedulesDTO {
   @IsArray()
   @ValidateNested({ each: true })
-  @Type(() => ScheduleConfigDTO)
-  schedules!: ScheduleConfigDTO[];
+  @Type(() => ScheduleConfigDto)
+  schedules!: ScheduleConfigDto[];
 }

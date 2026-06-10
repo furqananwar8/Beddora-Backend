@@ -7,7 +7,7 @@ export class CampaignSchedule {
   id!: number;
 
   @Property()
-  campaignId?: string;
+  campaignId!: string;
 
   @Property({ type: 'bigint' })
   profileId!: number;
@@ -19,10 +19,7 @@ export class CampaignSchedule {
   sessionId?: string;
 
   @Property()
-  scheduleDate?: string;
-
-  @Property({ nullable: true })
-  endDate?: string;
+  dayOfWeek!: number;
 
   @Property({ type: 'json' })
   timeSlots?: Array<{ startTime: string; endTime: string }>;
@@ -36,9 +33,9 @@ export class CampaignSchedule {
   @OneToMany(() => ScheduleJob, (job) => job.schedule)
   jobs = new Collection<ScheduleJob>(this);
 
-  @Property({ onCreate: () => new Date() , nullable: true })
+  @Property({ onCreate: () => new Date(), nullable: true })
   createdAt?: Date = new Date();
 
-  @Property({ onUpdate: () => new Date() , nullable: true })
+  @Property({ onUpdate: () => new Date(), nullable: true })
   updatedAt?: Date = new Date();
 }

@@ -118,12 +118,13 @@ async listCampaigns(
   @Post(':campaignId/schedule')
   @UseGuards(SessionAuthGuard)
   @ApiCookieAuth('sid')
-  @ApiOperation({ summary: 'Create day-parting schedules (diff-based)' })
+  @ApiOperation({ summary: 'Create recurring day-parting schedules by day-of-week' })
   @ApiBody({
     schema: {
       example: {
         schedules: [
-          { scheduleDate: '20260609', timeSlots: [{ startTime: '18:00', endTime: '19:00' }], action: 'ENABLED' },
+          { dayOfWeek: 1, timeSlots: [{ startTime: '09:00', endTime: '14:00' }], action: 'ENABLED' },
+          { dayOfWeek: 3, timeSlots: [{ startTime: '13:00', endTime: '17:00' }], action: 'ENABLED' },
         ],
       },
     },
@@ -133,6 +134,7 @@ async listCampaigns(
     @Req() req: Request,
     @Body() body: CreateSchedulesDTO,
   ) {
+    console.log("Request received", {body})
     if (!body.schedules?.length) {
       throw new BadRequestException('schedules array is required');
     }
@@ -143,7 +145,7 @@ async listCampaigns(
     if (!session?.profileId) {
       throw new BadRequestException('No Amazon Advertising profile linked to session');
     }
-
+    console.log({campaignId})
     const result = await this.expander.syncSchedules(
       campaignId,
       session.profileId as number,

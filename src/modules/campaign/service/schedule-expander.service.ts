@@ -11,8 +11,7 @@ interface TimeSlot {
 }
 
 interface ScheduleConfig {
-  scheduleDate: string;
-  endDate?: string;
+  dayOfWeek: number; // 0-6
   timeSlots: TimeSlot[];
   action: 'ENABLED' | 'PAUSED';
 }
@@ -41,6 +40,7 @@ export class ScheduleExpanderService {
     const em = this.em.fork();
     const existing = await this.fetchActive(em, campaignId);
 
+    // Partition: keep matching day+slots, cancel the rest
     const incomingKeys = this.keySet(incoming);
     const { keep, cancel } = this.partition(existing, incomingKeys);
 
@@ -66,7 +66,7 @@ export class ScheduleExpanderService {
     const keys = new Set<string>();
     for (const cfg of configs) {
       for (const slot of cfg.timeSlots) {
-        keys.add(`${cfg.scheduleDate}|${slot.startTime}|${slot.endTime}`);
+        keys.add(`${cfg.dayOfWeek}|${slot.startTime}|${slot.endTime}`);
       }
     }
     return keys;
@@ -81,7 +81,7 @@ export class ScheduleExpanderService {
 
     for (const schedule of existing) {
       const matches = (schedule.timeSlots ?? []).some(slot =>
-        incomingKeys.has(`${schedule.scheduleDate}|${slot.startTime}|${slot.endTime}`),
+        incomingKeys.has(`${schedule.dayOfWeek}|${slot.startTime}|${slot.endTime}`),
       );
       (matches ? keep : cancel).push(schedule);
     }
@@ -91,15 +91,15 @@ export class ScheduleExpanderService {
 
   private extractNew(incoming: ScheduleConfig[], keep: CampaignSchedule[]): ScheduleConfig[] {
     const keepKeys = new Set(
-      keep.flatMap(s => (s.timeSlots ?? []).map(slot => `${s.scheduleDate}|${slot.startTime}|${slot.endTime}`)),
+      keep.flatMap(s => (s.timeSlots ?? []).map(slot => `${s.dayOfWeek}|${slot.startTime}|${slot.endTime}`)),
     );
 
     const out: ScheduleConfig[] = [];
     for (const cfg of incoming) {
       for (const slot of cfg.timeSlots) {
-        const key = `${cfg.scheduleDate}|${slot.startTime}|${slot.endTime}`;
+        const key = `${cfg.dayOfWeek}|${slot.startTime}|${slot.endTime}`;
         if (!keepKeys.has(key)) {
-          out.push({ ...cfg, timeSlots: [slot] });
+          out.push({ dayOfWeek: cfg.dayOfWeek, timeSlots: [slot], action: cfg.action });
         }
       }
     }
@@ -149,6 +149,7 @@ export class ScheduleExpanderService {
     configs: ScheduleConfig[],
   ): Array<{ job: ScheduleJob; delay: number }> {
     const out: Array<{ job: ScheduleJob; delay: number }> = [];
+    const TEST_MODE = process.env.SCHEDULER_TEST_MODE === 'true';
 
     for (const cfg of configs) {
       const schedule = em.create(CampaignSchedule, {
@@ -156,30 +157,97 @@ export class ScheduleExpanderService {
         profileId,
         region,
         sessionId,
-        scheduleDate: cfg.scheduleDate,
-        endDate: cfg.endDate,
+        dayOfWeek: cfg.dayOfWeek,
         timeSlots: cfg.timeSlots,
         action: cfg.action,
         isActive: true,
       });
       em.persist(schedule);
 
-      const dates = this.dateRange(cfg.scheduleDate, cfg.endDate);
       const { startAction, endAction } = this.resolveActions(cfg.action);
 
-      for (const date of dates) {
-        for (const slot of cfg.timeSlots) {
-          const { startAt, endAt } = this.executionWindow(date, slot);
+      for (const slot of cfg.timeSlots) {
+        // Calculate next occurrence of this dayOfWeek in PST
+        const { startAt, endAt } = this.nextOccurrenceInPST(cfg.dayOfWeek, slot);
 
-          out.push(
-            { job: this.makeJob(em, schedule, campaignId, profileId, region, startAt, 'slot_start', startAction), delay: startAt.getTime() - Date.now() },
-            { job: this.makeJob(em, schedule, campaignId, profileId, region, endAt, 'slot_end', endAction), delay: endAt.getTime() - Date.now() },
-          );
-        }
+        out.push(
+          { job: this.makeJob(em, schedule, campaignId, profileId, region, startAt, 'slot_start', startAction), delay: startAt.getTime() - Date.now() },
+          { job: this.makeJob(em, schedule, campaignId, profileId, region, endAt, 'slot_end', endAction), delay: endAt.getTime() - Date.now() },
+        );
       }
     }
 
     return out;
+  }
+
+  /**
+   * Calculate the next occurrence of a given dayOfWeek in PST/PDT.
+   * If today is that day and the slot hasn't started yet, use today.
+   * Otherwise use next week.
+   */
+  private nextOccurrenceInPST(
+    dayOfWeek: number,
+    slot: TimeSlot,
+  ): { startAt: Date; endAt: Date } {
+    const now = new Date();
+    
+    // Get current PST date components
+    const pstNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+    const currentPSTDay = pstNow.getDay(); // 0=Sun, 1=Mon, ...
+    
+    // Calculate days until target day
+    let daysUntil = dayOfWeek - currentPSTDay;
+    if (daysUntil < 0) daysUntil += 7;
+    
+    // If same day, check if slot already passed
+    if (daysUntil === 0) {
+      const [slotHour, slotMin] = slot.startTime.split(':').map(Number);
+      const currentHour = pstNow.getHours();
+      const currentMin = pstNow.getMinutes();
+      
+      const slotTimeValue = slotHour * 60 + slotMin;
+      const currentTimeValue = currentHour * 60 + currentMin;
+      
+      if (slotTimeValue <= currentTimeValue) {
+        // Slot already passed today, use next week
+        daysUntil = 7;
+      }
+    }
+
+    // Build the target date in PST
+    const targetPST = new Date(pstNow);
+    targetPST.setDate(targetPST.getDate() + daysUntil);
+    
+    const [startHour, startMin] = slot.startTime.split(':').map(Number);
+    const [endHour, endMin] = slot.endTime.split(':').map(Number);
+    
+    // Create PST-local Date objects (browser/Node will interpret as local, but we treat as PST)
+    const startAt = new Date(
+      targetPST.getFullYear(),
+      targetPST.getMonth(),
+      targetPST.getDate(),
+      startHour,
+      startMin,
+      0,
+      0,
+    );
+    
+    let endAt = new Date(
+      targetPST.getFullYear(),
+      targetPST.getMonth(),
+      targetPST.getDate(),
+      endHour,
+      endMin,
+      0,
+      0,
+    );
+
+    // If end time is before start time, it spans midnight → next day
+    if (endAt <= startAt) {
+      endAt.setDate(endAt.getDate() + 1);
+    }
+
+    return { startAt, endAt };
   }
 
   private makeJob(
@@ -213,54 +281,13 @@ export class ScheduleExpanderService {
       await this.schedulerQueue.add('execute', { jobId: job.id }, {
         delay: safeDelay,
         jobId: `schedule-${job.id}`,
-        attempts: 3,                    // ← retry 3 times
+        attempts: 3,
         backoff: {
           type: 'exponential',
-          delay: 60000,               // ← 1 min, 2 min, 4 min
+          delay: 60000,
         },
       });
     }
-  }
-
-  private dateRange(startYmd: string, endYmd?: string): Date[] {
-    const start = this.parseYmd(startYmd);
-    const end = endYmd ? this.parseYmd(endYmd) : new Date(start);
-    const dates: Date[] = [];
-    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      dates.push(new Date(d));
-    }
-    return dates;
-  }
-
-  private executionWindow(date: Date, slot: TimeSlot): { startAt: Date; endAt: Date } {
-    const startAt = this.toLocalDate(date, slot.startTime);
-    const endAt = this.toLocalDate(date, slot.endTime);
-    if (endAt <= startAt) {
-      endAt.setDate(endAt.getDate() + 1);
-    }
-    return { startAt, endAt };
-  }
-
-  // PST local time — no UTC conversion
-  private toLocalDate(date: Date, time: string): Date {
-    const [h, min] = time.split(':').map(Number);
-    return new Date(
-      date.getFullYear(),
-      date.getMonth(),
-      date.getDate(),
-      h,
-      min,
-      0,
-      0,
-    );
-  }
-
-  private parseYmd(str: string): Date {
-    return new Date(
-      parseInt(str.slice(0, 4), 10),
-      parseInt(str.slice(4, 6), 10) - 1,
-      parseInt(str.slice(6, 8), 10),
-    );
   }
 
   private resolveActions(userAction: 'ENABLED' | 'PAUSED') {
