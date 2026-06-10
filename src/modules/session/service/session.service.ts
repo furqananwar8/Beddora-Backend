@@ -15,6 +15,7 @@ export interface SessionData {
   region?: string;
   profiles?: AmazonProfile[];
   countryCode?: string;
+  email?: string;
 }
 
 @Injectable()

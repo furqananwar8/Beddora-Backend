@@ -8,6 +8,7 @@ import {
   BadRequestException,
   UnauthorizedException,
   UseGuards,
+  ForbiddenException,
 } from '@nestjs/common';
 import type { Response, Request } from 'express';
 import { ApiTags, ApiOperation, ApiResponse, ApiQuery, ApiCookieAuth } from '@nestjs/swagger';
@@ -24,6 +25,7 @@ import { SESSION_COOKIE } from 'src/common/constants/session.constant';
 import { randomBytes } from 'crypto';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
+import { InvitedUser } from 'src/entities/invited-user';
 
 @ApiTags('Auth')
 @Controller('auth')
@@ -114,6 +116,8 @@ export class AuthController {
   }
 
   @Get('amazon/callback')
+  
+  @Get('amazon/callback')
   async amazonCallback(
     @Query('code') code: string,
     @Query('state') state: string,
@@ -133,7 +137,41 @@ export class AuthController {
 
     // Exchange code
     const { sessionId: finalSessionId, expiresIn, access_token } = await this.authService.exchangeCodeForTokens(code, sessionId);
-    // Fetch Amazon Advertising profiles and attach to session
+
+    // ── CHECK INVITED USERS TABLE ──
+    // Fetch Amazon profile to get email
+    let amazonEmail: string | undefined;
+    try {
+      const { data: profile } = await firstValueFrom(
+        this.httpService.get('https://api.amazon.com/user/profile', {
+          headers: { Authorization: `Bearer ${access_token}` },
+        }),
+      );
+      amazonEmail = profile.email?.toLowerCase();
+    } catch (e) {
+      console.error('[Amazon Profile] Failed to fetch email', e);
+      throw new BadRequestException('Failed to verify Amazon account email');
+    }
+
+    if (!amazonEmail) {
+      throw new BadRequestException('No email returned from Amazon');
+    }
+
+    // Check if invited
+    const invited = await this.em.findOne(InvitedUser, { email: amazonEmail });
+    if (!invited) {
+      throw new ForbiddenException('Email not invited. Contact admin to get access.');
+    }
+
+    // Update invited user on first login
+    if (!invited.hasLoggedIn) {
+      invited.hasLoggedIn = true;
+      invited.name = amazonEmail; // or fetch name from profile
+      await this.em.flush();
+    }
+    // ── END INVITE CHECK ──
+
+    // Fetch Amazon Advertising profiles
     let profileId: number | undefined;
     let region: 'na' | 'eu' | 'fe' = 'na';
     let countryCode: string | undefined;
@@ -151,7 +189,6 @@ export class AuthController {
           headers: { Authorization: `Bearer ${access_token}`, 'Amazon-Advertising-API-ClientId': clientId },
         }),
       );
-
 
       if (profiles?.length > 0) {
         const naCountries = ['US', 'CA', 'MX', 'BR'];
@@ -172,16 +209,15 @@ export class AuthController {
           };
         });
 
-        // Save ALL profiles to session
         await this.sessionService.update(finalSessionId, {
           profiles: mappedProfiles,
           profileId: mappedProfiles[0].profileId,
           region: mappedProfiles[0].region,
           countryCode: mappedProfiles[0].countryCode,
+          email: amazonEmail, // ← store email in session for admin guard
         }, expiresIn - 60);
       }
     } catch (e: any) {
-      // Log the FULL error so you know if it's 401, 403, or 404
       if (e.response) {
         console.error(`[Amazon API Error] ${e.response.status} ${e.config?.url}`);
         console.error(`[Amazon API Error Body]`, JSON.stringify(e.response.data, null, 2));
@@ -189,7 +225,6 @@ export class AuthController {
         console.error(`[Amazon API Error]`, e.message);
       }
       
-      // Hard fail — a session without profileId is useless for campaigns
       throw new BadRequestException(
         `Failed to link Amazon Advertising profile: ${e.response?.data?.details || e.message}`
       );
