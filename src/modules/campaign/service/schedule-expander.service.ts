@@ -30,6 +30,39 @@ export class ScheduleExpanderService {
     @InjectQueue('campaign-scheduler') private readonly schedulerQueue: Queue,
   ) {}
 
+async clearAllSchedules(
+  campaignId: string,
+): Promise<{ schedulesRemoved: number; jobsCancelled: number }> {
+  const em = this.em.fork();
+  const existing = await this.fetchActive(em, campaignId);
+
+  let jobsCancelled = 0;
+
+  for (const schedule of existing) {
+    // Get ALL jobs for this schedule (not just pending)
+    const jobs = await em.find(ScheduleJob, { schedule });
+
+    // Remove all BullMQ jobs (ignore errors if already processed/missing)
+    for (const job of jobs) {
+      try {
+        await this.schedulerQueue.remove(`schedule-${job.id}`);
+      } catch { /* ignore */ }
+      jobsCancelled++;
+    }
+
+    // Remove all ScheduleJob records from DB
+    await em.nativeDelete(ScheduleJob, { schedule });
+
+    // Remove the schedule itself
+    await em.removeAndFlush(schedule);
+  }
+
+  return {
+    schedulesRemoved: existing.length,
+    jobsCancelled,
+  };
+}
+
   async syncSchedules(
     campaignId: string,
     profileId: number,

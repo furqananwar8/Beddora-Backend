@@ -27,5 +27,6 @@ export class CreateSchedulesDTO {
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => ScheduleConfigDto)
+  @IsOptional() // ← allow empty array for clear
   schedules!: ScheduleConfigDto[];
 }

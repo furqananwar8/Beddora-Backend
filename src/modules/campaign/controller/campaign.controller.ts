@@ -134,18 +134,24 @@ async listCampaigns(
     @Req() req: Request,
     @Body() body: CreateSchedulesDTO,
   ) {
-    console.log("Request received", {body})
-    if (!body.schedules?.length) {
-      throw new BadRequestException('schedules array is required');
-    }
-
     const sessionId = req.cookies[SESSION_COOKIE];
     const session = await this.sessionService.get(sessionId);
 
     if (!session?.profileId) {
       throw new BadRequestException('No Amazon Advertising profile linked to session');
     }
-    console.log({campaignId})
+
+    // If empty array → clear all schedules for this campaign
+    if (!body.schedules || body.schedules.length === 0) {
+      const result = await this.expander.clearAllSchedules(campaignId);
+      return {
+        message: 'All schedules cleared',
+        campaignId,
+        ...result,
+      };
+    }
+
+    // Otherwise sync as usual
     const result = await this.expander.syncSchedules(
       campaignId,
       session.profileId as number,
