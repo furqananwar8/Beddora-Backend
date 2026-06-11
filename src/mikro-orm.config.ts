@@ -3,7 +3,8 @@ import { config } from 'dotenv';
 import { User } from './entities/user.entity';
 import { CampaignSchedule } from './entities/campaign-schedule.entity';
 import { ScheduleJob } from './entities/schedule-job.entity';
-import { InvitedUser } from './entities/invited-user';
+import { InvitedUser } from './entities/invited-user.entity';
+
 
 config();
 

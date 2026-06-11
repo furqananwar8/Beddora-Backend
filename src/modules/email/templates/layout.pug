@@ -1,0 +1,32 @@
+doctype html
+html
+  head
+    meta(charset="UTF-8")
+    meta(name="viewport", content="width=device-width, initial-scale=1.0")
+
+  body(style="margin:0; padding:0; background-color:#f4f6f8; font-family: Arial, Helvetica, sans-serif;")
+
+    table(width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f6f8; padding:40px 0;")
+      tr
+        td(align="center")
+
+          table(width="500" cellpadding="0" cellspacing="0" style="background:#ffffff; border-radius:8px; padding:40px; box-shadow:0 4px 10px rgba(0,0,0,0.05);")
+
+            include ./partials/header
+
+            tr
+              td(align="center")
+                h2(style="margin:0; color:#333;")
+                  block title
+
+            tr
+              td(style="padding-top:20px; color:#555; font-size:16px; line-height:1.6;")
+                block content
+
+            if otp
+              tr
+                td(align="center" style="padding:30px 0;")
+                  div(style="font-size:32px; letter-spacing:6px; font-weight:bold; color:#2d6cdf; background:#f1f5ff; padding:15px 25px; border-radius:6px; display:inline-block;")
+                    | #{otp}
+
+            include ./partials/footer

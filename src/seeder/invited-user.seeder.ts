@@ -1,5 +1,5 @@
 import { EntityManager } from '@mikro-orm/core';
-import { InvitedUser } from 'src/entities/invited-user';
+import { InvitedUser } from 'src/entities/invited-user.entity';
 
 
 export const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "khanjan@beddora.ca"; // ← change to your admin email

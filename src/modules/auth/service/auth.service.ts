@@ -1,7 +1,7 @@
 import { EntityManager } from '@mikro-orm/core';
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { randomBytes } from 'crypto';
+import { InvitedUser } from 'src/entities/invited-user.entity';
 import { User } from 'src/entities/user.entity';
 import { SessionData, SessionService } from 'src/modules/session/service/session.service';
 
@@ -23,10 +23,16 @@ export class AuthService {
   ) {}
 
   // Step 1 — Exchange authorization code for tokens
- async exchangeCodeForTokens(
-  code: string,
-  existingSessionId: string,
-): Promise<{ sessionId: string; expiresIn: number, access_token: string }> {
+  async exchangeCodeForTokens(
+    code: string,
+    existingSessionId: string,
+  ): Promise<{
+    sessionId: string;
+    expiresIn: number;
+    access_token: string;
+    email: string;
+    name: string;
+  }> {
     // Exchange code for tokens
     const tokenRes = await fetch('https://api.amazon.com/auth/o2/token', {
       method: 'POST',
@@ -55,7 +61,27 @@ export class AuthService {
     }
     const profile = await profileRes.json();
 
-    // Upsert user by stable amazon_user_id
+    // ── CHECK INVITED USERS TABLE ──
+    const amazonEmail = profile.email?.toLowerCase();
+    if (!amazonEmail) {
+      throw new BadRequestException('No email returned from Amazon');
+    }
+
+    const invited = await this.em.findOne(InvitedUser, { email: amazonEmail });
+    if (!invited) {
+      throw new ForbiddenException('Email not invited. Contact admin to get access.');
+    }
+
+    // Update invited user on first login
+    if (!invited.hasLoggedIn) {
+      invited.hasLoggedIn = true;
+      invited.name = profile.name || amazonEmail;
+      invited.amazonProfileId = Number(profile.user_id) || undefined;
+      await this.em.flush();
+    }
+    // ── END INVITE CHECK ──
+
+    // Upsert user by stable amazon_user_id (only if invited)
     let user = await this.em.findOne(User, { amazonUserId: profile.user_id });
 
     if (user) {
@@ -87,7 +113,13 @@ export class AuthService {
 
     await this.sessionService.update(existingSessionId, sessionData, tokenData.expires_in - 60);
 
-    return { sessionId: existingSessionId, expiresIn: tokenData.expires_in, access_token: tokenData.access_token, };
+    return {
+      sessionId: existingSessionId,
+      expiresIn: tokenData.expires_in,
+      access_token: tokenData.access_token,
+      email: amazonEmail,
+      name: profile.name,
+    };
   }
 
 
