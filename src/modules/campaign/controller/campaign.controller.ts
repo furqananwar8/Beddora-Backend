@@ -225,4 +225,55 @@ async listCampaigns(
     await em.flush();
     return { message: 'Schedule cancelled' };
   }
+
+  // @Post('test-update-status')
+  // async testUpdateStatus(
+  //   @Body()
+  //   body: {
+  //     campaignId: string;
+  //     profileId: number;
+  //     region: 'na' | 'eu' | 'fe';
+  //     state: 'ENABLED' | 'PAUSED';
+  //     // Optional: pass a specific access token, or we'll fetch from DB
+  //     accessToken?: string;
+  //   },
+  // ) {
+  //   const { campaignId, profileId, region, state, accessToken: providedToken } = body;
+
+  //   let accessToken = providedToken;
+
+  //   console.log(`[TEST] Calling Amazon API: ${state} campaign ${campaignId}`);
+  //   console.log(`[TEST] Profile: ${profileId}, Region: ${region}`);
+
+  //   try {
+  //     const result = await this.amazonClient.updateCampaign(
+  //       accessToken as string,
+  //       profileId,
+  //       region,
+  //       campaignId,
+  //       { state },
+  //     );
+
+  //     console.log(`[TEST] Amazon response:`, JSON.stringify(result, null, 2));
+
+  //     return {
+  //       success: true,
+  //       campaignId,
+  //       requestedState: state,
+  //       amazonResponse: result,
+  //     };
+  //   } catch (error: any) {
+  //     console.error(`[TEST] Amazon API failed:`, error);
+  //     throw new BadRequestException(
+  //       {
+  //         success: false,
+  //         campaignId,
+  //         requestedState: state,
+  //         error: error?.response?.data || error.message,
+  //         status: error?.response?.status,
+  //       },
+  //       error.status || 500,
+  //     );
+  //   }
+  // }
 }

@@ -97,15 +97,58 @@ export class AmazonCampaignApiClient {
   private readonly logger = new Logger(AmazonCampaignApiClient.name);
 
   constructor(private readonly httpService: HttpService, private readonly configService: ConfigService) {
-    this.httpService.axiosRef.interceptors.request.use((config) => {
-      this.logger.debug('HTTP REQUEST', JSON.stringify({
-        method: config.method?.toUpperCase(),
-        url: config.url,
-        headers: config.headers,
-        body: config.data,
-      }, null, 2));
-      return config;
-    });
+    // REQUEST interceptor
+    this.httpService.axiosRef.interceptors.request.use(
+      (config) => {
+        this.logger.debug(`HTTP REQUEST\n${JSON.stringify({
+          method: config.method?.toUpperCase(),
+          url: config.url,
+          headers: {
+            ...config.headers,
+            Authorization: config.headers?.Authorization
+              ? `${(config.headers.Authorization as string).substring(0, 30)}...`
+              : undefined,
+          },
+          body: config.data,
+        }, null, 2)}`);
+        return config;
+      },
+      (error) => {
+        this.logger.error(`HTTP REQUEST ERROR\n${JSON.stringify({
+          message: error.message,
+          config: {
+            method: error.config?.method?.toUpperCase(),
+            url: error.config?.url,
+          },
+        }, null, 2)}`);
+        return Promise.reject(error);
+      },
+    );
+
+    // RESPONSE interceptor
+    this.httpService.axiosRef.interceptors.response.use(
+      (response) => {
+        this.logger.debug(`HTTP RESPONSE\n${JSON.stringify({
+          status: response.status,
+          statusText: response.statusText,
+          url: response.config?.url,
+          method: response.config?.method?.toUpperCase(),
+          data: response.data,
+        }, null, 2)}`);
+        return response;
+      },
+      (error: AxiosError) => {
+        this.logger.error(`HTTP RESPONSE ERROR\n${JSON.stringify({
+          message: error.message,
+          status: error.response?.status,
+          statusText: error.response?.statusText,
+          url: error.config?.url,
+          method: error.config?.method?.toUpperCase(),
+          responseData: error.response?.data,
+        }, null, 2)}`);
+        return Promise.reject(error);
+      },
+    );
   }
 
   private getBaseUrl(region: 'na' | 'eu' | 'fe' = 'na') {
