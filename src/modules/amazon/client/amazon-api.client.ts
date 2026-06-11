@@ -185,13 +185,12 @@ async queryCampaignsByType(
   // Decode cursor — keys are STRINGS because JSON
   const cursors: Record<string, string | null> = cursor ? decodeCursor(cursor) : {};
    const perProfileLimit = search ? 500 : Math.ceil(limit / profiles.length);
-  console.log({cursors})
+
   // Fetch from ALL profiles in parallel
   const results = await Promise.all(
     profiles.map(async (profile) => {
       // BUG FIX: Use String(profileId) as key
       const profileToken = cursors[String(profile.profileId)] || undefined;
-      console.log({profile, profileToken})
       const { campaigns, nextToken } = await this.queryCampaignsForProfile({
         accessToken,
         profile,
@@ -200,7 +199,7 @@ async queryCampaignsByType(
         state,
         nextToken: profileToken,
       });
-      console.log({campaigns})
+
       return {
         profileId: profile.profileId,
         countryCode: profile.countryCode,
