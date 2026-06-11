@@ -50,7 +50,7 @@ export class CampaignController {
     return session;
   }
 
- @Get()
+@Get()
 @UseGuards(SessionAuthGuard)
 @ApiCookieAuth('sid')
 @ApiOperation({ summary: 'List campaigns by type (cursor-based)' })

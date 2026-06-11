@@ -80,7 +80,7 @@ async clearAllSchedules(
     const cancelled = await this.cancel(em, cancel);
     const create = this.extractNew(incoming, keep);
     const created = await this.create(em, campaignId, profileId, region, sessionId, create);
-
+    
     await em.flush();
 
     return {
@@ -201,6 +201,7 @@ async clearAllSchedules(
 
       for (const slot of cfg.timeSlots) {
         // Calculate next occurrence of this dayOfWeek in PST
+        console.log({slot})
         const { startAt, endAt } = this.nextOccurrenceInPST(cfg.dayOfWeek, slot);
 
         out.push(
@@ -213,71 +214,74 @@ async clearAllSchedules(
     return out;
   }
 
-  /**
-   * Calculate the next occurrence of a given dayOfWeek in PST/PDT.
-   * If today is that day and the slot hasn't started yet, use today.
-   * Otherwise use next week.
-   */
   private nextOccurrenceInPST(
     dayOfWeek: number,
     slot: TimeSlot,
   ): { startAt: Date; endAt: Date } {
     const now = new Date();
+    const timeZone = 'America/Los_Angeles';
+
+    // Get current PST day of week
+    const pstNowStr = now.toLocaleString('en-US', { 
+      timeZone, 
+      year: 'numeric', 
+      month: '2-digit', 
+      day: '2-digit',
+      hour: '2-digit', 
+      minute: '2-digit', 
+      second: '2-digit',
+      hour12: false 
+    });
     
-    // Get current PST date components
-    const pstNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-    const currentPSTDay = pstNow.getDay(); // 0=Sun, 1=Mon, ...
+    const [datePart, timePart] = pstNowStr.split(', ');
+    const [month, day, year] = datePart.split('/').map(Number);
+    const [hour, min] = timePart.split(':').map(Number);
     
-    // Calculate days until target day
+    const currentPSTDay = new Date(year, month - 1, day).getDay();
+
     let daysUntil = dayOfWeek - currentPSTDay;
     if (daysUntil < 0) daysUntil += 7;
-    
+
     // If same day, check if slot already passed
     if (daysUntil === 0) {
       const [slotHour, slotMin] = slot.startTime.split(':').map(Number);
-      const currentHour = pstNow.getHours();
-      const currentMin = pstNow.getMinutes();
-      
       const slotTimeValue = slotHour * 60 + slotMin;
-      const currentTimeValue = currentHour * 60 + currentMin;
+      const currentTimeValue = hour * 60 + min;
       
       if (slotTimeValue <= currentTimeValue) {
-        // Slot already passed today, use next week
         daysUntil = 7;
       }
     }
 
-    // Build the target date in PST
-    const targetPST = new Date(pstNow);
-    targetPST.setDate(targetPST.getDate() + daysUntil);
-    
+    // Calculate target date
+    const targetDate = new Date(year, month - 1, day + daysUntil);
+
     const [startHour, startMin] = slot.startTime.split(':').map(Number);
     const [endHour, endMin] = slot.endTime.split(':').map(Number);
-    
-    // Create PST-local Date objects (browser/Node will interpret as local, but we treat as PST)
-    const startAt = new Date(
-      targetPST.getFullYear(),
-      targetPST.getMonth(),
-      targetPST.getDate(),
+
+    // Store as UTC Date with same wall-clock numbers (15:00 = 15:00 UTC)
+    const startAt = new Date(Date.UTC(
+      targetDate.getFullYear(),
+      targetDate.getMonth(),
+      targetDate.getDate(),
       startHour,
       startMin,
       0,
-      0,
-    );
-    
-    let endAt = new Date(
-      targetPST.getFullYear(),
-      targetPST.getMonth(),
-      targetPST.getDate(),
+      0
+    ));
+
+    const endAt = new Date(Date.UTC(
+      targetDate.getFullYear(),
+      targetDate.getMonth(),
+      targetDate.getDate(),
       endHour,
       endMin,
       0,
-      0,
-    );
+      0
+    ));
 
-    // If end time is before start time, it spans midnight → next day
     if (endAt <= startAt) {
-      endAt.setDate(endAt.getDate() + 1);
+      endAt.setUTCDate(endAt.getUTCDate() + 1);
     }
 
     return { startAt, endAt };

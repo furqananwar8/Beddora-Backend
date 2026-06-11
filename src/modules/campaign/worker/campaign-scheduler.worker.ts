@@ -51,22 +51,23 @@ export class CampaignSchedulerWorker extends WorkerHost {
       }
 
       if (scheduleJob.action === 'ENABLE') {
-        // await this.amazonClient.updateCampaign(
-        //   session.access_token,
-        //   scheduleJob.profileId as number,
-        //   scheduleJob.region as 'na' | 'eu' | 'fe',
-        //   scheduleJob.campaignId as string,
-        //   { state: 'ENABLED' },
-        // );
+        //need to un comment this part out
+        await this.amazonClient.updateCampaign(
+          session.access_token,
+          scheduleJob.profileId as number,
+          scheduleJob.region as 'na' | 'eu' | 'fe',
+          scheduleJob.campaignId as string,
+          { state: 'ENABLED' },
+        );
         console.log(`[WORKER] ENABLED campaign ${scheduleJob.campaignId} at ${new Date().toISOString()}`);
       } else if (scheduleJob.action === 'PAUSE') {
-        // await this.amazonClient.updateCampaign(
-        //   session.access_token,
-        //   scheduleJob.profileId as number,
-        //   scheduleJob.region as 'na' | 'eu' | 'fe',
-        //   scheduleJob.campaignId as string,
-        //   { state: 'PAUSED' },
-        // );
+        await this.amazonClient.updateCampaign(
+          session.access_token,
+          scheduleJob.profileId as number,
+          scheduleJob.region as 'na' | 'eu' | 'fe',
+          scheduleJob.campaignId as string,
+          { state: 'PAUSED' },
+        );
         console.log(`[WORKER] PAUSED campaign ${scheduleJob.campaignId} at ${new Date().toISOString()}`);
       }
 
