@@ -57,7 +57,6 @@ export class CampaignSchedulerWorker extends WorkerHost {
       const diffMin = Math.round(diffMs / 60000);
       console.log(`[WORKER]   executeAt vs now: ${diffSec}s (${diffMin}min) ${diffMs > 0 ? 'LATE' : diffMs < 0 ? 'EARLY' : 'ON TIME'}`);
 
-      // Convert executeAt to PST for verification
       const executeAtPST = scheduleJob.executeAt.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
       console.log(`[WORKER]   executeAt in PST:   ${executeAtPST}`);
     }
@@ -145,7 +144,8 @@ export class CampaignSchedulerWorker extends WorkerHost {
 
   /**
    * After a job completes, schedule the same slot for next week.
-   * FIXED: Properly converts PST times to UTC for storage.
+   * FIXED: Uses all time slots from schedule instead of fragile hour-matching.
+   * FIXED: Properly handles DST transitions (PDT/PST).
    */
   private async scheduleNextWeek(
     em: EntityManager,
@@ -162,109 +162,120 @@ export class CampaignSchedulerWorker extends WorkerHost {
     console.log(`[WORKER] completedJob.executeAt (ISO)=${completedJob.executeAt.toISOString()}`);
     console.log(`[WORKER] completedJob.executeAt (PST)=${completedJob.executeAt.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`);
 
-    // Find the time slot that was just executed
-    const jobHourPST = parseInt(completedJob.executeAt.toLocaleString('en-US', { 
-      timeZone: 'America/Los_Angeles', 
-      hour: 'numeric', 
-      hour12: false 
-    }), 10);
+    // Use ALL time slots from the schedule — no fragile hour-matching
+    const timeSlots = schedule.timeSlots ?? [];
 
-    console.log(`[WORKER] Looking for slot with startHour (PST)=${jobHourPST}`);
-
-    const matchingSlot = (schedule.timeSlots ?? []).find(slot => {
-      const slotStartHour = parseInt(slot.startTime.split(':')[0], 10);
-      const isMatch = slotStartHour === jobHourPST;
-      console.log(`[WORKER]   Comparing slot.startTime=${slot.startTime} (hour=${slotStartHour}) vs jobHourPST=${jobHourPST} → ${isMatch ? 'MATCH' : 'no match'}`);
-      return isMatch;
-    });
-
-    if (!matchingSlot) {
-      console.log(`[WORKER] ❌ No matching slot found for PST hour ${jobHourPST}`);
+    if (timeSlots.length === 0) {
+      console.log(`[WORKER] ❌ No timeSlots found on schedule ${schedule.id}`);
       return;
     }
-    console.log(`[WORKER] ✅ Found matching slot: ${JSON.stringify(matchingSlot)}`);
 
-    // Calculate next week's date in PST
-    const nextWeekPST = new Date(completedJob.executeAt.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-    nextWeekPST.setDate(nextWeekPST.getDate() + 7);
+    console.log(`[WORKER] Found ${timeSlots.length} time slot(s) on schedule ${schedule.id}`);
 
-    console.log(`[WORKER] Next week PST date: ${nextWeekPST.toISOString()}`);
+    // For each time slot, create next week's jobs
+    for (const slot of timeSlots) {
+      console.log(`[WORKER] Processing slot for next week: ${JSON.stringify(slot)}`);
 
-    const [startHour, startMin] = matchingSlot.startTime.split(':').map(Number);
-    const [endHour, endMin] = matchingSlot.endTime.split(':').map(Number);
+      const [startHour, startMin] = slot.startTime.split(':').map(Number);
+      const [endHour, endMin] = slot.endTime.split(':').map(Number);
 
-    console.log(`[WORKER] Building next week jobs: start=${startHour}:${startMin}, end=${endHour}:${endMin} (PST)`);
+      // Calculate next week's date in PST
+      const nextWeekPST = new Date(completedJob.executeAt.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+      nextWeekPST.setDate(nextWeekPST.getDate() + 7);
 
-    // FIXED: Build PST time strings with explicit offset and convert to UTC
-    const startPSTString = `${nextWeekPST.getFullYear()}-${String(nextWeekPST.getMonth() + 1).padStart(2, '0')}-${String(nextWeekPST.getDate()).padStart(2, '0')}T${String(startHour).padStart(2, '0')}:${String(startMin).padStart(2, '0')}:00-07:00`;
-    const startAt = new Date(startPSTString);
+      console.log(`[WORKER] Next week PST date: ${nextWeekPST.toISOString()}`);
 
-    let endPSTString = `${nextWeekPST.getFullYear()}-${String(nextWeekPST.getMonth() + 1).padStart(2, '0')}-${String(nextWeekPST.getDate()).padStart(2, '0')}T${String(endHour).padStart(2, '0')}:${String(endMin).padStart(2, '0')}:00-07:00`;
-    let endAt = new Date(endPSTString);
+      // Determine if next week is PDT or PST
+      const offsetHours = this.isPDT(nextWeekPST.getFullYear(), nextWeekPST.getMonth() + 1, nextWeekPST.getDate()) ? 7 : 8;
+      const offsetStr = offsetHours === 7 ? '-07:00' : '-08:00';
+      console.log(`[WORKER] DST check: next week is ${offsetHours === 7 ? 'PDT (UTC-7)' : 'PST (UTC-8)'}`);
 
-    // If end time is before start time, it spans midnight → next day in PST
-    if (endAt <= startAt) {
-      const endNextDayPST = new Date(nextWeekPST);
-      endNextDayPST.setDate(endNextDayPST.getDate() + 1);
-      endPSTString = `${endNextDayPST.getFullYear()}-${String(endNextDayPST.getMonth() + 1).padStart(2, '0')}-${String(endNextDayPST.getDate()).padStart(2, '0')}T${String(endHour).padStart(2, '0')}:${String(endMin).padStart(2, '0')}:00-07:00`;
-      endAt = new Date(endPSTString);
-      console.log(`[WORKER] End time spans midnight, adjusted to next day`);
+      // Build PST time strings with explicit offset and convert to UTC
+      const startPSTString = `${nextWeekPST.getFullYear()}-${String(nextWeekPST.getMonth() + 1).padStart(2, '0')}-${String(nextWeekPST.getDate()).padStart(2, '0')}T${String(startHour).padStart(2, '0')}:${String(startMin).padStart(2, '0')}:00${offsetStr}`;
+      const startAt = new Date(startPSTString);
+
+      let endPSTString = `${nextWeekPST.getFullYear()}-${String(nextWeekPST.getMonth() + 1).padStart(2, '0')}-${String(nextWeekPST.getDate()).padStart(2, '0')}T${String(endHour).padStart(2, '0')}:${String(endMin).padStart(2, '0')}:00${offsetStr}`;
+      let endAt = new Date(endPSTString);
+
+      // If end time is before start time, it spans midnight → next day in PST
+      if (endAt <= startAt) {
+        const endNextDayPST = new Date(nextWeekPST);
+        endNextDayPST.setDate(endNextDayPST.getDate() + 1);
+        endPSTString = `${endNextDayPST.getFullYear()}-${String(endNextDayPST.getMonth() + 1).padStart(2, '0')}-${String(endNextDayPST.getDate()).padStart(2, '0')}T${String(endHour).padStart(2, '0')}:${String(endMin).padStart(2, '0')}:00${offsetStr}`;
+        endAt = new Date(endPSTString);
+        console.log(`[WORKER] End spans midnight, adjusted endAt=${endAt.toISOString()}`);
+      }
+
+      console.log(`[WORKER] Next week startAt (UTC)=${startAt.toISOString()} → PST=${startAt.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`);
+      console.log(`[WORKER] Next week endAt (UTC)=${endAt.toISOString()} → PST=${endAt.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`);
+
+      const { startAction, endAction } = this.resolveActions(schedule.action ?? 'ENABLED');
+
+      // Create new jobs for next week
+      const startJob = em.create(ScheduleJob, {
+        schedule,
+        campaignId: schedule.campaignId,
+        profileId: schedule.profileId,
+        region: schedule.region,
+        executeAt: startAt,
+        jobType: 'slot_start',
+        action: startAction,
+        status: 'pending',
+      });
+      em.persist(startJob);
+
+      const endJob = em.create(ScheduleJob, {
+        schedule,
+        campaignId: schedule.campaignId,
+        profileId: schedule.profileId,
+        region: schedule.region,
+        executeAt: endAt,
+        jobType: 'slot_end',
+        action: endAction,
+        status: 'pending',
+      });
+      em.persist(endJob);
+
+      await em.flush();
+      console.log(`[WORKER] ✅ Created next week jobs: startJob.id=${startJob.id}, endJob.id=${endJob.id}`);
+
+      const now = Date.now();
+      const startDelay = startAt.getTime() - now;
+      const endDelay = endAt.getTime() - now;
+
+      console.log(`[WORKER] Enqueueing with delays: start=${Math.round(startDelay/1000)}s, end=${Math.round(endDelay/1000)}s`);
+
+      await this.schedulerQueue.add('execute', { jobId: startJob.id }, {
+        delay: Math.max(0, startDelay),
+        jobId: `schedule-${startJob.id}`,
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 60000 },
+      });
+
+      await this.schedulerQueue.add('execute', { jobId: endJob.id }, {
+        delay: Math.max(0, endDelay),
+        jobId: `schedule-${endJob.id}`,
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 60000 },
+      });
+
+      console.log(`[WORKER] ✅ Re-queued next week jobs for slot ${slot.startTime}-${slot.endTime}`);
     }
+  }
 
-    console.log(`[WORKER] Next week startAt (UTC)=${startAt.toISOString()} → PST=${startAt.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`);
-    console.log(`[WORKER] Next week endAt (UTC)=${endAt.toISOString()} → PST=${endAt.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`);
-
-    const { startAction, endAction } = this.resolveActions(schedule.action ?? 'ENABLED');
-
-    // Create new jobs for next week
-    const startJob = em.create(ScheduleJob, {
-      schedule,
-      campaignId: schedule.campaignId,
-      profileId: schedule.profileId,
-      region: schedule.region,
-      executeAt: startAt,
-      jobType: 'slot_start',
-      action: startAction,
-      status: 'pending',
+  /**
+   * Check if a given date is in PDT (daylight saving) or PST (standard time).
+   */
+  private isPDT(year: number, month: number, day: number): boolean {
+    const date = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+    const pstString = date.toLocaleString('en-US', { 
+      timeZone: 'America/Los_Angeles',
+      timeZoneName: 'short',
+      hour12: false,
     });
-    em.persist(startJob);
-
-    const endJob = em.create(ScheduleJob, {
-      schedule,
-      campaignId: schedule.campaignId,
-      profileId: schedule.profileId,
-      region: schedule.region,
-      executeAt: endAt,
-      jobType: 'slot_end',
-      action: endAction,
-      status: 'pending',
-    });
-    em.persist(endJob);
-
-    await em.flush();
-    console.log(`[WORKER] ✅ Created next week jobs: startJob.id=${startJob.id}, endJob.id=${endJob.id}`);
-
-    const now = Date.now();
-    const startDelay = startAt.getTime() - now;
-    const endDelay = endAt.getTime() - now;
-
-    console.log(`[WORKER] Enqueueing with delays: start=${Math.round(startDelay/1000)}s, end=${Math.round(endDelay/1000)}s`);
-
-    await this.schedulerQueue.add('execute', { jobId: startJob.id }, {
-      delay: Math.max(0, startDelay),
-      jobId: `schedule-${startJob.id}`,
-      attempts: 3,
-      backoff: { type: 'exponential', delay: 60000 },
-    });
-
-    await this.schedulerQueue.add('execute', { jobId: endJob.id }, {
-      delay: Math.max(0, endDelay),
-      jobId: `schedule-${endJob.id}`,
-      attempts: 3,
-      backoff: { type: 'exponential', delay: 60000 },
-    });
-
-    console.log(`[WORKER] ✅ Re-queued weekly jobs for campaign ${schedule.campaignId} day ${schedule.dayOfWeek}`);
+    const isPDT = pstString.includes('PDT');
+    console.log(`[WORKER]   isPDT(${year}-${month}-${day}): ${pstString} → ${isPDT}`);
+    return isPDT;
   }
 
   private resolveActions(userAction: 'ENABLED' | 'PAUSED' | undefined) {
