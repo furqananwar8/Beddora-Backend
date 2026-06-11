@@ -11,7 +11,7 @@ interface TimeSlot {
 }
 
 interface ScheduleConfig {
-  dayOfWeek: number; // 0-6
+  dayOfWeek: number;
   timeSlots: TimeSlot[];
   action: 'ENABLED' | 'PAUSED';
 }
@@ -30,38 +30,31 @@ export class ScheduleExpanderService {
     @InjectQueue('campaign-scheduler') private readonly schedulerQueue: Queue,
   ) {}
 
-async clearAllSchedules(
-  campaignId: string,
-): Promise<{ schedulesRemoved: number; jobsCancelled: number }> {
-  const em = this.em.fork();
-  const existing = await this.fetchActive(em, campaignId);
+  async clearAllSchedules(
+    campaignId: string,
+  ): Promise<{ schedulesRemoved: number; jobsCancelled: number }> {
+    const em = this.em.fork();
+    const existing = await this.fetchActive(em, campaignId);
 
-  let jobsCancelled = 0;
+    let jobsCancelled = 0;
 
-  for (const schedule of existing) {
-    // Get ALL jobs for this schedule (not just pending)
-    const jobs = await em.find(ScheduleJob, { schedule });
-
-    // Remove all BullMQ jobs (ignore errors if already processed/missing)
-    for (const job of jobs) {
-      try {
-        await this.schedulerQueue.remove(`schedule-${job.id}`);
-      } catch { /* ignore */ }
-      jobsCancelled++;
+    for (const schedule of existing) {
+      const jobs = await em.find(ScheduleJob, { schedule });
+      for (const job of jobs) {
+        try {
+          await this.schedulerQueue.remove(`schedule-${job.id}`);
+        } catch { /* ignore */ }
+        jobsCancelled++;
+      }
+      await em.nativeDelete(ScheduleJob, { schedule });
+      await em.removeAndFlush(schedule);
     }
 
-    // Remove all ScheduleJob records from DB
-    await em.nativeDelete(ScheduleJob, { schedule });
-
-    // Remove the schedule itself
-    await em.removeAndFlush(schedule);
+    return {
+      schedulesRemoved: existing.length,
+      jobsCancelled,
+    };
   }
-
-  return {
-    schedulesRemoved: existing.length,
-    jobsCancelled,
-  };
-}
 
   async syncSchedules(
     campaignId: string,
@@ -73,14 +66,13 @@ async clearAllSchedules(
     const em = this.em.fork();
     const existing = await this.fetchActive(em, campaignId);
 
-    // Partition: keep matching day+slots, cancel the rest
     const incomingKeys = this.keySet(incoming);
     const { keep, cancel } = this.partition(existing, incomingKeys);
 
     const cancelled = await this.cancel(em, cancel);
     const create = this.extractNew(incoming, keep);
     const created = await this.create(em, campaignId, profileId, region, sessionId, create);
-    
+
     await em.flush();
 
     return {
@@ -182,7 +174,6 @@ async clearAllSchedules(
     configs: ScheduleConfig[],
   ): Array<{ job: ScheduleJob; delay: number }> {
     const out: Array<{ job: ScheduleJob; delay: number }> = [];
-    const TEST_MODE = process.env.SCHEDULER_TEST_MODE === 'true';
 
     for (const cfg of configs) {
       const schedule = em.create(CampaignSchedule, {
@@ -200,13 +191,17 @@ async clearAllSchedules(
       const { startAction, endAction } = this.resolveActions(cfg.action);
 
       for (const slot of cfg.timeSlots) {
-        // Calculate next occurrence of this dayOfWeek in PST
-        console.log({slot})
         const { startAt, endAt } = this.nextOccurrenceInPST(cfg.dayOfWeek, slot);
 
         out.push(
-          { job: this.makeJob(em, schedule, campaignId, profileId, region, startAt, 'slot_start', startAction), delay: startAt.getTime() - Date.now() },
-          { job: this.makeJob(em, schedule, campaignId, profileId, region, endAt, 'slot_end', endAction), delay: endAt.getTime() - Date.now() },
+          {
+            job: this.makeJob(em, schedule, campaignId, profileId, region, startAt, 'slot_start', startAction),
+            delay: startAt.getTime() - Date.now()
+          },
+          {
+            job: this.makeJob(em, schedule, campaignId, profileId, region, endAt, 'slot_end', endAction),
+            delay: endAt.getTime() - Date.now()
+          },
         );
       }
     }
@@ -218,73 +213,78 @@ async clearAllSchedules(
     dayOfWeek: number,
     slot: TimeSlot,
   ): { startAt: Date; endAt: Date } {
-    const now = new Date();
     const timeZone = 'America/Los_Angeles';
 
-    // Get current PST day of week
-    const pstNowStr = now.toLocaleString('en-US', { 
-      timeZone, 
-      year: 'numeric', 
-      month: '2-digit', 
-      day: '2-digit',
-      hour: '2-digit', 
-      minute: '2-digit', 
-      second: '2-digit',
-      hour12: false 
-    });
-    
-    const [datePart, timePart] = pstNowStr.split(', ');
-    const [month, day, year] = datePart.split('/').map(Number);
-    const [hour, min] = timePart.split(':').map(Number);
-    
-    const currentPSTDay = new Date(year, month - 1, day).getDay();
+    // Get current PST date components (works regardless of server timezone)
+    const now = new Date();
+    const pstParts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      year: 'numeric', month: 'numeric', day: 'numeric',
+      hour: 'numeric', minute: 'numeric', second: 'numeric',
+      hour12: false,
+    }).formatToParts(now);
+
+    const get = (type: string) => Number(pstParts.find(p => p.type === type)?.value ?? 0);
+
+    const pstYear = get('year');
+    const pstMonth = get('month');
+    const pstDay = get('day');
+    const pstHour = get('hour');
+    const pstMin = get('minute');
+
+    // Get PST day of week
+    const currentPSTDay = new Date(pstYear, pstMonth - 1, pstDay).getDay();
 
     let daysUntil = dayOfWeek - currentPSTDay;
     if (daysUntil < 0) daysUntil += 7;
 
-    // If same day, check if slot already passed
     if (daysUntil === 0) {
       const [slotHour, slotMin] = slot.startTime.split(':').map(Number);
       const slotTimeValue = slotHour * 60 + slotMin;
-      const currentTimeValue = hour * 60 + min;
-      
+      const currentTimeValue = pstHour * 60 + pstMin;
+
       if (slotTimeValue <= currentTimeValue) {
         daysUntil = 7;
       }
     }
 
-    // Calculate target date
-    const targetDate = new Date(year, month - 1, day + daysUntil);
+    // Calculate target PST date
+    const targetPST = new Date(pstYear, pstMonth - 1, pstDay + daysUntil);
+    const targetYear = targetPST.getFullYear();
+    const targetMonth = targetPST.getMonth() + 1;
+    const targetDay = targetPST.getDate();
 
     const [startHour, startMin] = slot.startTime.split(':').map(Number);
     const [endHour, endMin] = slot.endTime.split(':').map(Number);
 
-    // Store as UTC Date with same wall-clock numbers (15:00 = 15:00 UTC)
+    // Convert PST wall-clock time to UTC timestamp for storage
+    const offsetHours = this.isPDT(targetYear, targetMonth, targetDay) ? 7 : 8;
+
     const startAt = new Date(Date.UTC(
-      targetDate.getFullYear(),
-      targetDate.getMonth(),
-      targetDate.getDate(),
-      startHour,
-      startMin,
-      0,
-      0
+      targetYear, targetMonth - 1, targetDay,
+      startHour + offsetHours, startMin, 0, 0
     ));
 
-    const endAt = new Date(Date.UTC(
-      targetDate.getFullYear(),
-      targetDate.getMonth(),
-      targetDate.getDate(),
-      endHour,
-      endMin,
-      0,
-      0
+    let endAt = new Date(Date.UTC(
+      targetYear, targetMonth - 1, targetDay,
+      endHour + offsetHours, endMin, 0, 0
     ));
 
     if (endAt <= startAt) {
-      endAt.setUTCDate(endAt.getUTCDate() + 1);
+      endAt = new Date(endAt.getTime() + 24 * 60 * 60 * 1000);
     }
 
     return { startAt, endAt };
+  }
+
+  private isPDT(year: number, month: number, day: number): boolean {
+    const date = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
+    const pstString = date.toLocaleString('en-US', { 
+      timeZone: 'America/Los_Angeles',
+      timeZoneName: 'short',
+      hour12: false,
+    });
+    return pstString.includes('PDT');
   }
 
   private makeJob(
@@ -319,10 +319,7 @@ async clearAllSchedules(
         delay: safeDelay,
         jobId: `schedule-${job.id}`,
         attempts: 3,
-        backoff: {
-          type: 'exponential',
-          delay: 60000,
-        },
+        backoff: { type: 'exponential', delay: 60000 },
       });
     }
   }
