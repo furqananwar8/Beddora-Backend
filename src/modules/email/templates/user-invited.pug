@@ -1,0 +1,26 @@
+extends ./layout
+
+block title
+  | You're Invited
+
+block content
+  | Hi 
+  strong #{name},
+  br
+  br
+  | An administrator from 
+  strong #{companyName}
+  |  has invited you to join our platform.
+  br
+  br
+  | Please click the button below to accept your invitation and set up your account:
+  br
+  br
+
+  div(style="text-align:center; width:100%; margin: 20px 0;")
+    a(
+      href=inviteUrl
+      style="display:inline-block; padding:12px 20px; background-color:#2563eb; color:#ffffff; text-decoration:none; border-radius:6px; font-weight:bold;"
+    ) Accept Invitation
+  br
+  

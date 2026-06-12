@@ -8,6 +8,7 @@ import {
   BadRequestException,
   UnauthorizedException,
   UseGuards,
+  ForbiddenException,
 } from '@nestjs/common';
 import type { Response, Request } from 'express';
 import { ApiTags, ApiOperation, ApiResponse, ApiQuery, ApiCookieAuth } from '@nestjs/swagger';
@@ -24,6 +25,7 @@ import { SESSION_COOKIE } from 'src/common/constants/session.constant';
 import { randomBytes } from 'crypto';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
+import { InvitedUser } from 'src/entities/invited-user.entity';
 
 @ApiTags('Auth')
 @Controller('auth')
@@ -89,8 +91,6 @@ export class AuthController {
         300,
       );
 
-     
-
       res.cookie(SESSION_COOKIE, newSessionId, {
         httpOnly: true,
         sameSite: this.isProd ? 'none' : 'lax',
@@ -131,9 +131,15 @@ export class AuthController {
     if (!session) throw new UnauthorizedException('Session expired');
     if (state !== session.oauthState) throw new UnauthorizedException('Invalid OAuth state');
 
-    // Exchange code
-    const { sessionId: finalSessionId, expiresIn, access_token } = await this.authService.exchangeCodeForTokens(code, sessionId);
-    // Fetch Amazon Advertising profiles and attach to session
+    // Exchange code — invite check happens inside here now
+    const {
+      sessionId: finalSessionId,
+      expiresIn,
+      access_token,
+      email: amazonEmail,
+    } = await this.authService.exchangeCodeForTokens(code, sessionId);
+
+    // Fetch Amazon Advertising profiles
     let profileId: number | undefined;
     let region: 'na' | 'eu' | 'fe' = 'na';
     let countryCode: string | undefined;
@@ -148,10 +154,12 @@ export class AuthController {
           currencyCode: string;
           timezone: string;
         }>>('https://advertising-api.amazon.com/profiles', {
-          headers: { Authorization: `Bearer ${access_token}`, 'Amazon-Advertising-API-ClientId': clientId },
+          headers: {
+            Authorization: `Bearer ${access_token}`,
+            'Amazon-Advertising-API-ClientId': clientId,
+          },
         }),
       );
-
 
       if (profiles?.length > 0) {
         const naCountries = ['US', 'CA', 'MX', 'BR'];
@@ -172,26 +180,28 @@ export class AuthController {
           };
         });
 
-        // Save ALL profiles to session
-        await this.sessionService.update(finalSessionId, {
-          profiles: mappedProfiles,
-          profileId: mappedProfiles[0].profileId,
-          region: mappedProfiles[0].region,
-          countryCode: mappedProfiles[0].countryCode,
-        }, expiresIn - 60);
+        await this.sessionService.update(
+          finalSessionId,
+          {
+            profiles: mappedProfiles,
+            profileId: mappedProfiles[0].profileId,
+            region: mappedProfiles[0].region,
+            countryCode: mappedProfiles[0].countryCode,
+            email: amazonEmail,
+          },
+          expiresIn - 60,
+        );
       }
     } catch (e: any) {
-      // Log the FULL error so you know if it's 401, 403, or 404
       if (e.response) {
         console.error(`[Amazon API Error] ${e.response.status} ${e.config?.url}`);
         console.error(`[Amazon API Error Body]`, JSON.stringify(e.response.data, null, 2));
       } else {
         console.error(`[Amazon API Error]`, e.message);
       }
-      
-      // Hard fail — a session without profileId is useless for campaigns
+
       throw new BadRequestException(
-        `Failed to link Amazon Advertising profile: ${e.response?.data?.details || e.message}`
+        `Failed to link Amazon Advertising profile: ${e.response?.data?.details || e.message}`,
       );
     }
 

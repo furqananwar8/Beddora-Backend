@@ -13,12 +13,14 @@ import { REDIS_CLIENT } from './redis/redis.provider';
 import Redis from 'ioredis';
 import { AMAZON_TOKEN_REFRESH } from './common/constants/bullmq.constant';
 import { CampaignModule } from './modules/campaign/campaign.module';
+import { EmailModule } from './modules/email/email.module';
+import { UserModule } from './modules/user/user.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     RedisModule, // <-- shared Redis connection
-    
+    EmailModule,
     BullModule.forRootAsync({
       imports: [RedisModule],
       useFactory: (redis: Redis) => ({
@@ -50,7 +52,8 @@ import { CampaignModule } from './modules/campaign/campaign.module';
     
     SessionModule,
     AuthModule,
-    CampaignModule
+    CampaignModule,
+    UserModule
   ],
   providers: [AppService],
   controllers: [AppController],

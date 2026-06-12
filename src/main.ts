@@ -3,12 +3,17 @@ import { AppModule } from './app.module';
 import cookieParser from 'cookie-parser';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
+import { EntityManager } from '@mikro-orm/core';
+import { seedAdminUser } from './seeder/invited-user.seeder';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
   const configService = app.get(ConfigService);
 
+  const em = app.get(EntityManager);
+  await seedAdminUser(em.fork());
+  
   const allowedOrigins = configService
     .get<string>('CORS_ORIGINS')
     ?.split(',')
