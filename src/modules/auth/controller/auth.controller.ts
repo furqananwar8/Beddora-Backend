@@ -244,8 +244,6 @@ export class AuthController {
     if (!session) throw new UnauthorizedException('Session expired');
 
     const user = await this.em.findOne(User, { id: parseInt(session.userId) });
-    const finalUserOutput = {...user};
-    delete finalUserOutput.amazonUserId;
     
     if (!user) {
       await this.sessionService.delete(sessionId);
@@ -253,7 +251,20 @@ export class AuthController {
       throw new UnauthorizedException('User not found');
     }
 
-    return res.status(200).json({ message: "Profile retrieved successfully", user: finalUserOutput });
+    // Remove sensitive fields
+    const finalUserOutput = { ...user };
+    delete (finalUserOutput as any).amazonUserId;
+
+    // Check invited user record by email from session
+    const invitedRecord = await this.em.findOne(InvitedUser, { 
+      email: session.email?.toLowerCase() 
+    });
+
+    return res.status(200).json({ 
+      message: "Profile retrieved successfully", 
+      user: finalUserOutput,
+      invitedBy: invitedRecord?.invitedBy ?? null,
+    });
   }
 
   @Post('logout')
