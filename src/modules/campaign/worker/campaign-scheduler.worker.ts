@@ -1,12 +1,14 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { Processor, WorkerHost, OnWorkerEvent } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
 import { EntityManager } from '@mikro-orm/core';
 import { ScheduleJob } from 'src/entities/schedule-job.entity';
 import { CampaignSchedule } from 'src/entities/campaign-schedule.entity';
 import { AmazonCampaignApiClient } from '../../amazon/client/amazon-api.client';
 import { SessionService } from 'src/modules/session/service/session.service';
+import { EmailService } from 'src/modules/email/service/email.service';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
+import { ConfigService } from '@nestjs/config';
 
 @Processor('campaign-scheduler', { concurrency: 1 })
 export class CampaignSchedulerWorker extends WorkerHost {
@@ -14,6 +16,8 @@ export class CampaignSchedulerWorker extends WorkerHost {
     private readonly em: EntityManager,
     private readonly amazonClient: AmazonCampaignApiClient,
     private readonly sessionService: SessionService,
+    private readonly emailService: EmailService,
+    private readonly configService: ConfigService,
     @InjectQueue('campaign-scheduler') private readonly schedulerQueue: Queue,
   ) {
     super();
@@ -140,6 +144,85 @@ export class CampaignSchedulerWorker extends WorkerHost {
     }
 
     console.log(`[WORKER] ════════════════════════════════════════════════════════`);
+  }
+
+  /**
+   * Handle failed events from BullMQ — called when job fails after all retries exhausted
+   */
+  @OnWorkerEvent('failed')
+  async onFailed(job: Job<{ jobId: number }>, err: Error): Promise<void> {
+    const em = this.em.fork();
+    const maxRetries = job.opts.attempts ?? 3;
+    const currentAttempt = job.attemptsMade;
+
+    console.log(`[WORKER-EVENT] Job ${job.id} (data.jobId=${job.data.jobId}) FAILED permanently`);
+    console.log(`[WORKER-EVENT] Error: ${err.message}`);
+    console.log(`[WORKER-EVENT] Attempts: ${currentAttempt}/${maxRetries}`);
+
+    const scheduleJob = await em.findOne(
+      ScheduleJob,
+      { id: job.data.jobId },
+      { populate: ['schedule'] },
+    );
+
+    if (!scheduleJob) {
+      console.log(`[WORKER-EVENT] ❌ ScheduleJob ${job.data.jobId} not found in DB`);
+      return;
+    }
+
+    // Send email notification to admin
+    await this.notifyAdminOfFailure(scheduleJob, err, currentAttempt);
+
+    // If retries exhausted, delete from database
+    if (currentAttempt >= maxRetries) {
+      console.log(`[WORKER-EVENT] Max retries (${maxRetries}) exhausted. Deleting job ${job.data.jobId} from DB.`);
+      await em.remove(scheduleJob).flush();
+      console.log(`[WORKER-EVENT] ✅ Job ${job.data.jobId} deleted from DB`);
+    } else {
+      console.log(`[WORKER-EVENT] Retries not exhausted (${currentAttempt}/${maxRetries}). Keeping job in DB for retry.`);
+    }
+  }
+
+  /**
+   * Send failure notification email to admin
+   */
+  private async notifyAdminOfFailure(
+    scheduleJob: ScheduleJob,
+    err: Error,
+    attemptsMade: number,
+  ): Promise<void> {
+    const adminEmail = this.configService.get<string>('ADMIN_EMAIL');
+    if (!adminEmail) {
+      console.log(`[WORKER-EVENT] ⚠️ ADMIN_EMAIL not configured, skipping failure notification`);
+      return;
+    }
+
+    const campaignId = scheduleJob.campaignId;
+    const action = scheduleJob.action;
+    const jobType = scheduleJob.jobType;
+    const executeAt = scheduleJob.executeAt?.toISOString() ?? 'N/A';
+    const scheduleId = scheduleJob.schedule?.id ?? 'N/A' as any;
+
+    try {
+      this.emailService.sendFailedJobEmail({
+        to: adminEmail,
+        subject: `Campaign Scheduler Failure: ${campaignId}`,
+        template: 'job-failed',
+        context: {
+          campaignId,
+          action,
+          jobType,
+          scheduleId,
+          executeAt,
+          errorMessage: err.message,
+          attemptsMade,
+          timestamp: new Date().toISOString(),
+        },
+      });
+      console.log(`[WORKER-EVENT] ✅ Failure email sent to admin: ${adminEmail}`);
+    } catch (emailErr: any) {
+      console.log(`[WORKER-EVENT] ❌ Failed to send admin email: ${emailErr.message}`);
+    }
   }
 
   /**

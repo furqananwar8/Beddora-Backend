@@ -1,0 +1,34 @@
+extends ./layout
+
+block title
+  | Campaign Scheduler Failure
+
+block content
+  | A scheduled campaign job has failed after all retry attempts.
+  br
+  br
+  strong Campaign ID: 
+  | #{campaignId}
+  br
+  strong Action: 
+  | #{action}
+  br
+  strong Job Type: 
+  | #{jobType}
+  br
+  strong Schedule ID: 
+  | #{scheduleId}
+  br
+  strong Scheduled Execute At: 
+  | #{executeAt}
+  br
+  strong Attempts Made: 
+  | #{attemptsMade}
+  br
+  strong Error: 
+  | #{errorMessage}
+  br
+  br
+  | Please check the system logs for more details.
+  br
+  | Timestamp: #{timestamp}

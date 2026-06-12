@@ -10,4 +10,7 @@ export class EmailService {
         this.eventEmitter.emit("user.invited", payload)
     }
 
+    sendFailedJobEmail(payload: EmailTemplate){
+        this.eventEmitter.emit("job.failed", payload)
+    }
 }

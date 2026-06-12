@@ -226,6 +226,49 @@ async listCampaigns(
     return { message: 'Schedule cancelled' };
   }
 
+
+  // Add temporarily to your AuthController or a test controller
+  // @Post('test/fail-job')
+  // @ApiOperation({ summary: 'Test job failure email (dev only)' })
+  // async testJobFailure() {
+  //   const em = this.em.fork();
+
+  //   // Create a fake campaign schedule first
+  //   const fakeSchedule = em.create(CampaignSchedule, {
+  //     campaignId: 'test-campaign-123',
+  //     profileId: 12345,
+  //     region: 'na',
+  //     dayOfWeek: 1,
+  //     action: 'ENABLED',
+  //     timeSlots: [{ startTime: '09:00', endTime: '17:00' }],
+  //     isActive: true,
+  //     sessionId: 'test-session-123',
+  //   });
+  //   await em.persistAndFlush(fakeSchedule);
+
+  //   // Create schedule job linked to the schedule
+  //   const fakeJob = em.create(ScheduleJob, {
+  //     schedule: fakeSchedule,
+  //     campaignId: 'test-campaign-123',
+  //     profileId: 12345,
+  //     region: 'na',
+  //     executeAt: new Date(),
+  //     jobType: 'slot_start',
+  //     action: 'ENABLE',
+  //     status: 'pending',
+  //   });
+  //   await em.persist(fakeJob).flush();
+
+  //   // Add to BullMQ queue with 1 retry for quick testing
+  //   await this.schedulerQueue.add('execute', { jobId: fakeJob.id }, {
+  //     delay: 0,
+  //     attempts: 1,
+  //     backoff: { type: 'fixed', delay: 1000 },
+  //   });
+
+  //   return { message: 'Test job queued', jobId: fakeJob.id, scheduleId: fakeSchedule.id };
+  // }
+
   // @Post('test-update-status')
   // async testUpdateStatus(
   //   @Body()

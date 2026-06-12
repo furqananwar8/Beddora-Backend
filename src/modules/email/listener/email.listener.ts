@@ -19,4 +19,16 @@ export class EmailListener {
 
         await this.mailService.sendMail(mailConfiguration)
     }
+
+    @OnEvent("job.failed")
+    async handleFailedJobEmail(payload: EmailTemplate) {
+        const { template, ...otherConfigurations } = payload;
+        const mailConfiguration = {
+            ...otherConfigurations
+        }
+
+        if(template) mailConfiguration["template"] = template;
+
+        await this.mailService.sendMail(mailConfiguration)
+    }
 }

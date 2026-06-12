@@ -9,11 +9,13 @@ import { CampaignController } from './controller/campaign.controller';
 import { ScheduleExpanderService } from './service/schedule-expander.service';
 import { CampaignSchedulerWorker } from './worker/campaign-scheduler.worker';
 import { SessionModule } from 'src/modules/session/session.module';
+import { EmailModule } from '../email/email.module';
 
 @Module({
   imports: [
     HttpModule,
     SessionModule,
+    EmailModule,
     BullModule.registerQueue({ name: 'campaign-scheduler' }),
   ],
   controllers: [CampaignController, AmazonApiController],
