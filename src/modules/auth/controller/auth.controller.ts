@@ -21,7 +21,7 @@ import { Queue } from 'bullmq';
 import { AMAZON_TOKEN_REFRESH, REFRESH_JOB_DELAY_MS } from 'src/common/constants/bullmq.constant';
 import { ConfigService } from '@nestjs/config';
 import { SessionAuthGuard } from 'src/guards/SessionAuth.guard';
-import { SESSION_COOKIE } from 'src/common/constants/session.constant';
+import { EXPIRES_IN_30DAYS, EXPIRES_IN_30MIN, SESSION_COOKIE } from 'src/common/constants/session.constant';
 import { randomBytes } from 'crypto';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
@@ -46,68 +46,57 @@ export class AuthController {
   @ApiOperation({ summary: 'Initiate Amazon OAuth login' })
   @ApiCookieAuth('sid')
   @ApiResponse({ status: 200, description: 'Amazon OAuth URL' })
+
   async amazonLogin(
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const existingSessionId = req.cookies?.[SESSION_COOKIE];
     const state = crypto.randomUUID();
-    let sessionId = existingSessionId;
+    const existingSessionId = req.cookies?.[SESSION_COOKIE];
 
-    // If we have an existing cookie, try to update Redis
+    // Clean up any existing session/cookie
     if (existingSessionId) {
-      const updated = await this.sessionService.update(
-        existingSessionId,
-        { oauthState: state },
-        300,
-      );
-
-      // Redis doesn't have this session — cookie is stale
-      if (!updated) {
-        // Clear the bad cookie immediately
-        res.clearCookie(SESSION_COOKIE, {
-          path: '/',
-          sameSite: this.isProd ? 'none' : 'lax',
-          secure: this.isProd,
-          httpOnly: true,
-        });
-        sessionId = null; // Force new session creation below
-      }
-    }
-
-    // No valid session — create a new one
-    if (!sessionId) {
-      const newSessionId = randomBytes(32).toString('base64url');
-      await this.sessionService.create(
-        newSessionId,
-        {
-          oauthState: state,
-          userId: '',
-          access_token: '',
-          refresh_token: '',
-          token_type: '',
-          expires_at: 0,
-        },
-        300,
-      );
-
-      res.cookie(SESSION_COOKIE, newSessionId, {
-        httpOnly: true,
+      await this.sessionService.delete(existingSessionId);
+      res.clearCookie(SESSION_COOKIE, {
+        path: '/',
         sameSite: this.isProd ? 'none' : 'lax',
         secure: this.isProd,
-        path: '/',
-        maxAge: 300 * 1000,
+        httpOnly: true,
       });
-
-      sessionId = newSessionId;
     }
+
+    const newSessionId = randomBytes(32).toString('base64url');
+    await this.sessionService.create(
+      newSessionId,
+      {
+        oauthState: state,
+        userId: '',
+        access_token: '',
+        refresh_token: '',
+        token_type: '',
+        expires_at: 0,
+      },
+      EXPIRES_IN_30MIN,
+    );
+
+    // Encode sessionId + state in state parameter for callback retrieval
+    const encodedState = Buffer.from(JSON.stringify({ state, sessionId: newSessionId })).toString('base64url');
+
+    // Set cookie for same-site requests (optional, won't work on cross-site redirect)
+    res.cookie(SESSION_COOKIE, newSessionId, {
+      httpOnly: true,
+      sameSite: this.isProd ? 'none' : 'lax',
+      secure: this.isProd,
+      path: '/',
+      maxAge: EXPIRES_IN_30MIN * 1000,
+    });
 
     const params = new URLSearchParams({
       client_id: this.configService.getOrThrow('AMAZON_CLIENT_ID'),
       response_type: 'code',
       redirect_uri: this.configService.getOrThrow('AMAZON_REDIRECT_URI'),
       scope: 'profile advertising::campaign_management',
-      state,
+      state: encodedState,  // ← Contains both state and sessionId
     });
 
     return { url: `https://www.amazon.com/ap/oa?${params.toString()}` };
@@ -116,7 +105,7 @@ export class AuthController {
   @Get('amazon/callback')
   async amazonCallback(
     @Query('code') code: string,
-    @Query('state') state: string,
+    @Query('state') encodedState: string,
     @Query('error') error: string,
     @Req() req: Request,
     @Res() res: Response,
@@ -124,14 +113,23 @@ export class AuthController {
     if (error) throw new BadRequestException(`Amazon OAuth error: ${error}`);
     if (!code) throw new BadRequestException('Missing authorization code');
 
-    const sessionId = req.cookies?.[SESSION_COOKIE];
-    if (!sessionId) throw new UnauthorizedException('No session found');
+    let state: string;
+    let sessionId: string;
+    try {
+      const decoded = JSON.parse(Buffer.from(encodedState, 'base64url').toString());
+      state = decoded.state;
+      sessionId = decoded.sessionId;
+    } catch {
+      throw new UnauthorizedException('Invalid state parameter');
+    }
+
+    if (!sessionId) throw new UnauthorizedException('No session found in state');
 
     const session = await this.sessionService.get(sessionId);
     if (!session) throw new UnauthorizedException('Session expired');
     if (state !== session.oauthState) throw new UnauthorizedException('Invalid OAuth state');
 
-    // Exchange code — invite check happens inside here now
+    // Exchange code for tokens
     const {
       sessionId: finalSessionId,
       expiresIn,
@@ -183,6 +181,8 @@ export class AuthController {
         await this.sessionService.update(
           finalSessionId,
           {
+            token_type: 'bearer',
+            expires_at: Date.now() + (expiresIn * 1000),
             profiles: mappedProfiles,
             profileId: mappedProfiles[0].profileId,
             region: mappedProfiles[0].region,
@@ -193,23 +193,19 @@ export class AuthController {
         );
       }
     } catch (e: any) {
-      if (e.response) {
-        console.error(`[Amazon API Error] ${e.response.status} ${e.config?.url}`);
-        console.error(`[Amazon API Error Body]`, JSON.stringify(e.response.data, null, 2));
-      } else {
-        console.error(`[Amazon API Error]`, e.message);
-      }
-
-      throw new BadRequestException(
-        `Failed to link Amazon Advertising profile: ${e.response?.data?.details || e.message}`,
-      );
+      return res.status(200).json({
+        success: false,
+        error: e.response?.error || 'UNKNOWN_ERROR',
+        message: e.message,
+      });
     }
 
+    // Set cookie to the NEW authenticated session
     res.cookie(SESSION_COOKIE, finalSessionId, {
       httpOnly: true,
-      sameSite: 'none',
-      secure: true,
-      maxAge: (expiresIn - 60) * 1000,
+      sameSite: 'lax',      // ← Required for cross-site redirect from Amazon
+      secure: this.isProd,
+      maxAge: EXPIRES_IN_30DAYS,
       path: '/',
     });
 

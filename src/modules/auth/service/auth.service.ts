@@ -1,6 +1,7 @@
 import { EntityManager } from '@mikro-orm/core';
 import { BadRequestException, ForbiddenException, Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { randomBytes } from 'crypto';
 import { InvitedUser } from 'src/entities/invited-user.entity';
 import { User } from 'src/entities/user.entity';
 import { SessionData, SessionService } from 'src/modules/session/service/session.service';
@@ -69,7 +70,11 @@ export class AuthService {
 
     const invited = await this.em.findOne(InvitedUser, { email: amazonEmail });
     if (!invited) {
-      throw new ForbiddenException('Email not invited. Contact admin to get access.');
+        throw new ForbiddenException({
+        statusCode: 403,
+        message: 'Email not invited. Contact admin to get access.',
+        error: 'NOT_INVITED',  // Specific error code
+      });
     }
 
     // Update invited user on first login
@@ -83,12 +88,9 @@ export class AuthService {
 
     // Upsert user by stable amazon_user_id (only if invited)
     let user = await this.em.findOne(User, { amazonUserId: profile.user_id });
-
+    
     if (user) {
-      this.em.assign(user, {
-        name: profile.name,
-        lastLoginAt: new Date(),
-      });
+      this.em.assign(user, { name: profile.name, lastLoginAt: new Date() });
     } else {
       user = this.em.create(User, {
         amazonUserId: profile.user_id,
@@ -96,14 +98,17 @@ export class AuthService {
         lastLoginAt: new Date(),
       });
     }
-
     await this.em.persist(user).flush();
 
-    // Create Redis session
+    // Delete the temporary OAuth session
+    await this.sessionService.delete(existingSessionId);
+
+    // Create NEW authenticated session
+    const newSessionId = randomBytes(32).toString('base64url');
     const expiresAt = Date.now() + tokenData.expires_in * 1000;
 
     const sessionData: SessionData = {
-      userId: String(user.id)!,
+      userId: String(user.id),
       access_token: tokenData.access_token,
       refresh_token: tokenData.refresh_token,
       token_type: tokenData.token_type,
@@ -111,10 +116,10 @@ export class AuthService {
       oauthState: undefined,
     };
 
-    await this.sessionService.update(existingSessionId, sessionData, tokenData.expires_in - 60);
+    await this.sessionService.create(newSessionId, sessionData, tokenData.expires_in - 60);
 
     return {
-      sessionId: existingSessionId,
+      sessionId: newSessionId,
       expiresIn: tokenData.expires_in,
       access_token: tokenData.access_token,
       email: amazonEmail,
