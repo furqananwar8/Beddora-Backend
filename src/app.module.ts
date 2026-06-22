@@ -9,8 +9,6 @@ import { SessionModule } from './modules/session/session.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { REDIS_CLIENT } from './redis/redis.provider';
-import Redis from 'ioredis';
 import { AMAZON_TOKEN_REFRESH } from './common/constants/bullmq.constant';
 import { CampaignModule } from './modules/campaign/campaign.module';
 import { EmailModule } from './modules/email/email.module';
@@ -19,20 +17,25 @@ import { UserModule } from './modules/user/user.module';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
-    RedisModule, // <-- shared Redis connection
+    RedisModule,
     EmailModule,
     BullModule.forRootAsync({
-      imports: [RedisModule],
-      useFactory: (redis: Redis) => ({
-        connection: redis,
+      imports: [ConfigModule],
+      useFactory: (config: ConfigService) => ({
+        connection: {
+          host: config.get('REDIS_HOST', 'localhost'),
+          port: config.get<number>('REDIS_PORT', 6379),
+          maxRetriesPerRequest: null,
+          enableReadyCheck: false,
+        },
       }),
-      inject: [REDIS_CLIENT],
+      inject: [ConfigService],
     }),
-    
+
     BullModule.registerQueue({
       name: AMAZON_TOKEN_REFRESH,
     }),
-    
+
     MikroOrmModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
@@ -49,7 +52,7 @@ import { UserModule } from './modules/user/user.module';
         autoLoadEntities: true,
       }),
     }),
-    
+
     SessionModule,
     AuthModule,
     CampaignModule,

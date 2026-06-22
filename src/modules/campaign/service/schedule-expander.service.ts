@@ -43,7 +43,9 @@ export class ScheduleExpanderService {
       for (const job of jobs) {
         try {
           await this.schedulerQueue.remove(`schedule-${job.id}`);
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
         jobsCancelled++;
       }
       await em.nativeDelete(ScheduleJob, { schedule });
@@ -101,6 +103,68 @@ export class ScheduleExpanderService {
     };
   }
 
+  /**
+   * Diagnostic: find DB pending jobs missing from BullMQ
+   */
+  async findOrphanedJobs(campaignId?: string): Promise<Array<{ jobId: number; campaignId: string; executeAt: Date }>> {
+    const em = this.em.fork();
+    const where = campaignId ? { status: 'pending', campaignId } : { status: 'pending' } as any;
+    const pendingJobs = await em.find(ScheduleJob, where);
+
+    const orphaned: Array<{ jobId: number; campaignId: string; executeAt: Date }> = [];
+
+    for (const job of pendingJobs) {
+      const bullJob = await this.schedulerQueue.getJob(`schedule-${job.id}`);
+      if (!bullJob) {
+        orphaned.push({
+          jobId: job.id,
+          campaignId: job.campaignId as any,
+          executeAt: job.executeAt!,
+        });
+        console.log(`[DIAG] Orphaned job found: DB id=${job.id}, no BullMQ job exists`);
+      }
+    }
+
+    return orphaned;
+  }
+
+  /**
+   * Repair orphaned jobs by re-enqueueing them
+   */
+  async repairOrphanedJobs(campaignId?: string): Promise<number> {
+    const orphaned = await this.findOrphanedJobs(campaignId);
+    let repaired = 0;
+
+    for (const orphan of orphaned) {
+      const em = this.em.fork();
+      const job = await em.findOne(ScheduleJob, { id: orphan.jobId });
+
+      if (!job?.executeAt) continue;
+
+      const delay = job.executeAt.getTime() - Date.now();
+      if (delay < -3600000) {
+        console.log(`[REPAIR] Job ${job.id} is too far in the past, marking as failed`);
+        job.status = 'failed';
+        job.errorMessage = 'Orphaned job - missed execution window';
+        await em.flush();
+        continue;
+      }
+
+      const bullJobId = `schedule-${job.id}`;
+      await this.schedulerQueue.add('execute', { jobId: job.id }, {
+        delay: Math.max(0, delay),
+        jobId: bullJobId,
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 60000 },
+      });
+
+      console.log(`[REPAIR] Re-enqueued job ${job.id} with delay=${Math.round(delay / 1000)}s`);
+      repaired++;
+    }
+
+    return repaired;
+  }
+
   private async fetchActive(em: EntityManager, campaignId: string): Promise<CampaignSchedule[]> {
     return em.find(CampaignSchedule, { campaignId, isActive: true });
   }
@@ -123,26 +187,42 @@ export class ScheduleExpanderService {
     const cancel: CampaignSchedule[] = [];
 
     for (const schedule of existing) {
-      const matches = (schedule.timeSlots ?? []).some(slot =>
-        incomingKeys.has(`${schedule.dayOfWeek}|${slot.startTime}|${slot.endTime}`),
-      );
-      (matches ? keep : cancel).push(schedule);
+      const slot = schedule.timeSlots?.[0];
+      if (!slot) {
+        cancel.push(schedule);
+        continue;
+      }
+
+      const key = `${schedule.dayOfWeek}|${slot.startTime}|${slot.endTime}`;
+      if (incomingKeys.has(key)) {
+        keep.push(schedule);
+      } else {
+        cancel.push(schedule);
+      }
     }
 
     return { keep, cancel };
   }
 
   private extractNew(incoming: ScheduleConfig[], keep: CampaignSchedule[]): ScheduleConfig[] {
-    const keepKeys = new Set(
-      keep.flatMap(s => (s.timeSlots ?? []).map(slot => `${s.dayOfWeek}|${slot.startTime}|${slot.endTime}`)),
-    );
+    const keepKeys = new Set<string>();
+    for (const schedule of keep) {
+      const slot = schedule.timeSlots?.[0];
+      if (slot) {
+        keepKeys.add(`${schedule.dayOfWeek}|${slot.startTime}|${slot.endTime}`);
+      }
+    }
 
     const out: ScheduleConfig[] = [];
     for (const cfg of incoming) {
       for (const slot of cfg.timeSlots) {
         const key = `${cfg.dayOfWeek}|${slot.startTime}|${slot.endTime}`;
         if (!keepKeys.has(key)) {
-          out.push({ dayOfWeek: cfg.dayOfWeek, timeSlots: [slot], action: cfg.action });
+          out.push({
+            dayOfWeek: cfg.dayOfWeek,
+            timeSlots: [slot],
+            action: cfg.action,
+          });
         }
       }
     }
@@ -158,7 +238,9 @@ export class ScheduleExpanderService {
         try {
           await this.schedulerQueue.remove(`schedule-${job.id}`);
           console.log(`[EXPANDER]   Removed queue job schedule-${job.id}`);
-        } catch { /* noop */ }
+        } catch {
+          /* noop */
+        }
         job.status = 'cancelled';
         count++;
       }
@@ -197,25 +279,24 @@ export class ScheduleExpanderService {
 
     for (const cfg of configs) {
       console.log(`[EXPANDER] Building schedule for dayOfWeek=${cfg.dayOfWeek}, action=${cfg.action}`);
-      console.log(`[EXPANDER]   timeSlots=${JSON.stringify(cfg.timeSlots)}`);
-
-      const schedule = em.create(CampaignSchedule, {
-        campaignId,
-        profileId,
-        region,
-        sessionId,
-        dayOfWeek: cfg.dayOfWeek,
-        timeSlots: cfg.timeSlots,
-        action: cfg.action,
-        isActive: true,
-      });
-      em.persist(schedule);
-      console.log(`[EXPANDER]   Created CampaignSchedule id=${schedule.id}`);
-
       const { startAction, endAction } = this.resolveActions(cfg.action);
 
       for (const slot of cfg.timeSlots) {
         console.log(`[EXPANDER]   Processing slot: ${slot.startTime} - ${slot.endTime}`);
+
+        const schedule = em.create(CampaignSchedule, {
+          campaignId,
+          profileId,
+          region,
+          sessionId,
+          dayOfWeek: cfg.dayOfWeek,
+          timeSlots: [slot],
+          action: cfg.action,
+          isActive: true,
+        });
+        em.persist(schedule);
+        console.log(`[EXPANDER]   Created CampaignSchedule id=${schedule.id} with slot [${slot.startTime}-${slot.endTime}]`);
+
         const { startAt, endAt } = this.nextOccurrenceInPST(cfg.dayOfWeek, slot);
 
         console.log(`[EXPANDER]   startAt (UTC)=${startAt.toISOString()} → PST=${startAt.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`);
@@ -227,8 +308,8 @@ export class ScheduleExpanderService {
         const startDelay = startAt.getTime() - Date.now();
         const endDelay = endAt.getTime() - Date.now();
 
-        console.log(`[EXPANDER]   startJob.id=${startJob.id}, delay=${Math.round(startDelay/1000)}s`);
-        console.log(`[EXPANDER]   endJob.id=${endJob.id}, delay=${Math.round(endDelay/1000)}s`);
+        console.log(`[EXPANDER]   startJob.id=${startJob.id}, delay=${Math.round(startDelay / 1000)}s`);
+        console.log(`[EXPANDER]   endJob.id=${endJob.id}, delay=${Math.round(endDelay / 1000)}s`);
 
         out.push({ job: startJob, delay: startDelay });
         out.push({ job: endJob, delay: endDelay });
@@ -247,11 +328,14 @@ export class ScheduleExpanderService {
 
     console.log(`[EXPANDER] nextOccurrenceInPST called: dayOfWeek=${dayOfWeek}, slot=${JSON.stringify(slot)}`);
 
-    // Get current PST date components (works regardless of server timezone)
     const pstParts = new Intl.DateTimeFormat('en-US', {
       timeZone,
-      year: 'numeric', month: 'numeric', day: 'numeric',
-      hour: 'numeric', minute: 'numeric', second: 'numeric',
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: 'numeric',
+      second: 'numeric',
       hour12: false,
     }).formatToParts(now);
 
@@ -263,9 +347,8 @@ export class ScheduleExpanderService {
     const pstHour = get('hour');
     const pstMin = get('minute');
 
-    console.log(`[EXPANDER]   Current PST: ${pstYear}-${String(pstMonth).padStart(2,'0')}-${String(pstDay).padStart(2,'0')} ${String(pstHour).padStart(2,'0')}:${String(pstMin).padStart(2,'0')}`);
+    console.log(`[EXPANDER]   Current PST: ${pstYear}-${String(pstMonth).padStart(2, '0')}-${String(pstDay).padStart(2, '0')} ${String(pstHour).padStart(2, '0')}:${String(pstMin).padStart(2, '0')}`);
 
-    // Get PST day of week
     const currentPSTDay = new Date(pstYear, pstMonth - 1, pstDay).getDay();
     console.log(`[EXPANDER]   currentPSTDay=${currentPSTDay} (0=Sun, 1=Mon, ...), targetDay=${dayOfWeek}`);
 
@@ -288,32 +371,49 @@ export class ScheduleExpanderService {
       }
     }
 
-    // Calculate target PST date
-    const targetPST = new Date(pstYear, pstMonth - 1, pstDay + daysUntil);
-    const targetYear = targetPST.getFullYear();
-    const targetMonth = targetPST.getMonth() + 1;
-    const targetDay = targetPST.getDate();
+    // FIXED: Manual date rollover instead of relying on server local timezone
+    let targetDayNum = pstDay + daysUntil;
+    let targetMonthNum = pstMonth;
+    let targetYearNum = pstYear;
 
-    console.log(`[EXPANDER]   Target PST date: ${targetYear}-${String(targetMonth).padStart(2,'0')}-${String(targetDay).padStart(2,'0')}`);
+    const daysInMonth = new Date(Date.UTC(targetYearNum, targetMonthNum, 0)).getDate();
+    if (targetDayNum > daysInMonth) {
+      targetDayNum -= daysInMonth;
+      targetMonthNum++;
+      if (targetMonthNum > 12) {
+        targetMonthNum = 1;
+        targetYearNum++;
+      }
+    }
+
+    console.log(`[EXPANDER]   Target PST date: ${targetYearNum}-${String(targetMonthNum).padStart(2, '0')}-${String(targetDayNum).padStart(2, '0')}`);
 
     const [startHour, startMin] = slot.startTime.split(':').map(Number);
     const [endHour, endMin] = slot.endTime.split(':').map(Number);
 
     console.log(`[EXPANDER]   Slot times: start=${startHour}:${startMin}, end=${endHour}:${endMin} (PST wall-clock)`);
 
-    // Determine if target date is in PDT or PST
-    const offsetHours = this.isPDT(targetYear, targetMonth, targetDay) ? 7 : 8;
+    const offsetHours = this.isPDT(targetYearNum, targetMonthNum, targetDayNum) ? 7 : 8;
     console.log(`[EXPANDER]   DST check: target is ${offsetHours === 7 ? 'PDT (UTC-7)' : 'PST (UTC-8)'}`);
 
-    // Convert PST wall-clock time to UTC timestamp for storage
     const startAt = new Date(Date.UTC(
-      targetYear, targetMonth - 1, targetDay,
-      startHour + offsetHours, startMin, 0, 0
+      targetYearNum,
+      targetMonthNum - 1,
+      targetDayNum,
+      startHour + offsetHours,
+      startMin,
+      0,
+      0,
     ));
 
     let endAt = new Date(Date.UTC(
-      targetYear, targetMonth - 1, targetDay,
-      endHour + offsetHours, endMin, 0, 0
+      targetYearNum,
+      targetMonthNum - 1,
+      targetDayNum,
+      endHour + offsetHours,
+      endMin,
+      0,
+      0,
     ));
 
     console.log(`[EXPANDER]   Before midnight check: startAt=${startAt.toISOString()}, endAt=${endAt.toISOString()}`);
@@ -331,7 +431,7 @@ export class ScheduleExpanderService {
 
   private isPDT(year: number, month: number, day: number): boolean {
     const date = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
-    const pstString = date.toLocaleString('en-US', { 
+    const pstString = date.toLocaleString('en-US', {
       timeZone: 'America/Los_Angeles',
       timeZoneName: 'short',
       hour12: false,
@@ -369,15 +469,35 @@ export class ScheduleExpanderService {
     console.log(`[EXPANDER] Enqueueing ${items.length} jobs to BullMQ`);
     for (const { job, delay } of items) {
       if (!job.executeAt) continue;
+
+      const bullJobId = `schedule-${job.id}`;
       const safeDelay = Math.max(0, delay);
-      console.log(`[EXPANDER]   Adding job ${job.id} (${job.jobType}, ${job.action}) with delay=${Math.round(safeDelay/1000)}s, executeAt=${job.executeAt.toISOString()}`);
-      await this.schedulerQueue.add('execute', { jobId: job.id }, {
-        delay: safeDelay,
-        jobId: `schedule-${job.id}`,
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 60000 },
-      });
-      console.log(`[EXPANDER]   ✅ Enqueued schedule-${job.id}`);
+
+      const existingJob = await this.schedulerQueue.getJob(bullJobId);
+      if (existingJob) {
+        console.log(`[EXPANDER]   ⚠️ Job ${bullJobId} already exists (state=${await existingJob.getState()}), removing first`);
+        try {
+          await this.schedulerQueue.remove(bullJobId);
+          console.log(`[EXPANDER]   ✅ Removed existing job ${bullJobId}`);
+        } catch (err) {
+          console.log(`[EXPANDER]   ❌ Failed to remove existing job ${bullJobId}: ${err}`);
+        }
+      }
+
+      console.log(`[EXPANDER]   Adding job ${job.id} (${job.jobType}, ${job.action}) with delay=${Math.round(safeDelay / 1000)}s, executeAt=${job.executeAt.toISOString()}`);
+
+      await this.schedulerQueue.add(
+        'execute',
+        { jobId: job.id },
+        {
+          delay: safeDelay,
+          jobId: bullJobId,
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 60000 },
+        },
+      );
+
+      console.log(`[EXPANDER]   ✅ Enqueued ${bullJobId}`);
     }
   }
 

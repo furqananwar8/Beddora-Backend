@@ -226,6 +226,12 @@ async listCampaigns(
     return { message: 'Schedule cancelled' };
   }
 
+  @Post('scheduler/repair')
+  @UseGuards(SessionAuthGuard)
+  async repairScheduler() {
+    const result = await this.expander.repairOrphanedJobs();
+    return { repaired: result };
+  }
 
   // Add temporarily to your AuthController or a test controller
   // @Post('test/fail-job')
