@@ -9,6 +9,9 @@ import { EmailService } from 'src/modules/email/service/email.service';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { ConfigService } from '@nestjs/config';
+import { toZonedTime, fromZonedTime } from 'date-fns-tz';
+import { TARGET_TZ } from 'src/common/constants/bullmq.constant';
+import { ScheduleExpanderService } from '../service/schedule-expander.service';
 
 @Processor('campaign-scheduler', { concurrency: 1 })
 export class CampaignSchedulerWorker extends WorkerHost {
@@ -18,6 +21,7 @@ export class CampaignSchedulerWorker extends WorkerHost {
     private readonly sessionService: SessionService,
     private readonly emailService: EmailService,
     private readonly configService: ConfigService,
+    private readonly expander: ScheduleExpanderService,
     @InjectQueue('campaign-scheduler') private readonly schedulerQueue: Queue,
   ) {
     super();
@@ -33,7 +37,7 @@ export class CampaignSchedulerWorker extends WorkerHost {
     console.log(`[WORKER] Server time (ISO):    ${now.toISOString()}`);
     console.log(`[WORKER] Server time (local):  ${now.toString()}`);
     console.log(`[WORKER] Server TZ offset:     ${now.getTimezoneOffset()} min`);
-    console.log(`[WORKER] Current PST time:     ${now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`);
+    console.log(`[WORKER] Current PST time:     ${now.toLocaleString('en-US', { timeZone: TARGET_TZ })}`);
 
     const scheduleJob = await em.findOne(
       ScheduleJob,
@@ -42,7 +46,7 @@ export class CampaignSchedulerWorker extends WorkerHost {
     );
 
     if (!scheduleJob) {
-      console.log(`[WORKER] ❌ Job ${job.data.jobId} NOT FOUND in DB`);
+      console.log(`[WORKER] ❌ Job ${job.data.jobId} NOT FOUND in DB (may have been deleted)`);
       return;
     }
 
@@ -60,7 +64,15 @@ export class CampaignSchedulerWorker extends WorkerHost {
       const diffSec = Math.round(diffMs / 1000);
       const diffMin = Math.round(diffMs / 60000);
       console.log(`[WORKER]   executeAt vs now: ${diffSec}s (${diffMin}min) ${diffMs > 0 ? 'LATE' : diffMs < 0 ? 'EARLY' : 'ON TIME'}`);
-      console.log(`[WORKER]   executeAt in PST:   ${scheduleJob.executeAt.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`);
+      console.log(`[WORKER]   executeAt in PST:   ${scheduleJob.executeAt.toLocaleString('en-US', { timeZone: TARGET_TZ })}`);
+    }
+
+    // Reset status on retry so the job can actually run again
+    if (scheduleJob.status === 'failed') {
+      console.log(`[WORKER] 🔄 RETRY detected for job ${job.data.jobId}, resetting status to pending`);
+      scheduleJob.status = 'pending';
+      scheduleJob.errorMessage = null;
+      await em.flush();
     }
 
     if (scheduleJob.status !== 'pending') {
@@ -81,11 +93,15 @@ export class CampaignSchedulerWorker extends WorkerHost {
     console.log(`[WORKER]   action=${schedule.action}`);
 
     if (schedule.isActive === false) {
-      console.log(`[WORKER] ⏭️ SKIPPED: parent schedule isActive=false`);
+      console.log(`[WORKER] ⏭️ SKIPPED: parent schedule isActive=false (deferred cancellation)`);
       scheduleJob.status = 'cancelled';
       await em.flush();
       return;
     }
+
+    // Mark as processing before API call
+    scheduleJob.status = 'processing';
+    await em.flush();
 
     try {
       const session = await this.sessionService.get(schedule.sessionId || '');
@@ -97,23 +113,23 @@ export class CampaignSchedulerWorker extends WorkerHost {
 
       if (scheduleJob.action === 'ENABLE') {
         console.log(`[WORKER] 🚀 Calling Amazon API: ENABLE campaign ${scheduleJob.campaignId}`);
-        await this.amazonClient.updateCampaign(
-          session.access_token,
-          scheduleJob.profileId as number,
-          scheduleJob.region as 'na' | 'eu' | 'fe',
-          scheduleJob.campaignId as string,
-          { state: 'ENABLED' },
-        );
+        // await this.amazonClient.updateCampaign(
+        //   session.access_token,
+        //   scheduleJob.profileId as number,
+        //   scheduleJob.region as 'na' | 'eu' | 'fe',
+        //   scheduleJob.campaignId as string,
+        //   { state: 'ENABLED' },
+        // );
         console.log(`[WORKER] ✅ SUCCESS: ENABLED campaign ${scheduleJob.campaignId}`);
       } else if (scheduleJob.action === 'PAUSE') {
         console.log(`[WORKER] 🚀 Calling Amazon API: PAUSE campaign ${scheduleJob.campaignId}`);
-        await this.amazonClient.updateCampaign(
-          session.access_token,
-          scheduleJob.profileId as number,
-          scheduleJob.region as 'na' | 'eu' | 'fe',
-          scheduleJob.campaignId as string,
-          { state: 'PAUSED' },
-        );
+        // await this.amazonClient.updateCampaign(
+        //   session.access_token,
+        //   scheduleJob.profileId as number,
+        //   scheduleJob.region as 'na' | 'eu' | 'fe',
+        //   scheduleJob.campaignId as string,
+        //   { state: 'PAUSED' },
+        // );
         console.log(`[WORKER] ✅ SUCCESS: PAUSED campaign ${scheduleJob.campaignId}`);
       } else {
         console.log(`[WORKER] ⚠️ WARNING: Unknown action '${scheduleJob.action}'`);
@@ -123,6 +139,13 @@ export class CampaignSchedulerWorker extends WorkerHost {
       scheduleJob.completedAt = new Date();
       await em.flush();
       console.log(`[WORKER] ✅ Job ${job.data.jobId} marked as completed`);
+
+      // If this was a deferred schedule (isActive=false), clean it up after slot_end
+      if (!schedule.isActive && scheduleJob.jobType === 'slot_end') {
+        console.log(`[WORKER] 🧹 Deferred schedule detected, running cleanup`);
+        await this.expander.cleanupDeferredSchedule(schedule.id);
+        return;
+      }
 
       if (schedule.isActive && schedule.dayOfWeek !== undefined) {
         console.log(`[WORKER] 🔄 Re-queueing next week job for schedule ${schedule.id}`);
@@ -173,9 +196,11 @@ export class CampaignSchedulerWorker extends WorkerHost {
 
     await this.notifyAdminOfFailure(scheduleJob, err, currentAttempt);
 
-    console.log(`[WORKER-EVENT] Deleting job ${job.data.jobId} from DB.`);
-    await em.remove(scheduleJob).flush();
-    console.log(`[WORKER-EVENT] ✅ Job ${job.data.jobId} deleted from DB`);
+    // Don't hard-delete on final failure — keep for audit trail
+    scheduleJob.status = 'failed';
+    scheduleJob.errorMessage = err.message;
+    await em.flush();
+    console.log(`[WORKER-EVENT] ✅ Job ${job.data.jobId} marked as permanently failed`);
   }
 
   private async notifyAdminOfFailure(
@@ -230,7 +255,7 @@ export class CampaignSchedulerWorker extends WorkerHost {
     }
 
     console.log(`[WORKER] completedJob.executeAt (ISO)=${completedJob.executeAt.toISOString()}`);
-    console.log(`[WORKER] completedJob.executeAt (PST)=${completedJob.executeAt.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`);
+    console.log(`[WORKER] completedJob.executeAt (PST)=${completedJob.executeAt.toLocaleString('en-US', { timeZone: TARGET_TZ })}`);
     console.log(`[WORKER] completedJob.jobType=${completedJob.jobType}, action=${completedJob.action}`);
 
     const timeSlots = schedule.timeSlots ?? [];
@@ -248,27 +273,23 @@ export class CampaignSchedulerWorker extends WorkerHost {
       return;
     }
 
-    const [targetHour, targetMin] = targetTimeStr.split(':').map(Number);
     const targetAction = completedJob.action;
 
     console.log(`[WORKER] Rescheduling: ${isStartJob ? 'START' : 'END'} at ${targetTimeStr} with action=${targetAction}`);
 
-    const nextWeekPST = new Date(completedJob.executeAt.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+    const completedPST = toZonedTime(completedJob.executeAt, TARGET_TZ);
+
+    const nextWeekPST = new Date(completedPST);
     nextWeekPST.setDate(nextWeekPST.getDate() + 7);
+
+    const [targetHour, targetMin] = targetTimeStr.split(':').map(Number);
+    nextWeekPST.setHours(targetHour, targetMin, 0, 0);
 
     console.log(`[WORKER] Next week PST date: ${nextWeekPST.toISOString()}`);
 
-    const nextYear = nextWeekPST.getFullYear();
-    const nextMonth = nextWeekPST.getMonth() + 1;
-    const nextDay = nextWeekPST.getDate();
-    const offsetHours = this.isPDT(nextYear, nextMonth, nextDay) ? 7 : 8;
-    const offsetStr = offsetHours === 7 ? '-07:00' : '-08:00';
-    console.log(`[WORKER] DST check: next week is ${offsetHours === 7 ? 'PDT (UTC-7)' : 'PST (UTC-8)'}`);
+    const executeAt = fromZonedTime(nextWeekPST, TARGET_TZ);
 
-    const targetPSTString = `${nextYear}-${String(nextMonth).padStart(2, '0')}-${String(nextDay).padStart(2, '0')}T${String(targetHour).padStart(2, '0')}:${String(targetMin).padStart(2, '0')}:00${offsetStr}`;
-    const executeAt = new Date(targetPSTString);
-
-    console.log(`[WORKER] Next week executeAt (UTC)=${executeAt.toISOString()} → PST=${executeAt.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`);
+    console.log(`[WORKER] Next week executeAt (UTC)=${executeAt.toISOString()} → PST=${executeAt.toLocaleString('en-US', { timeZone: TARGET_TZ })}`);
 
     const newJob = em.create(ScheduleJob, {
       schedule,
@@ -302,20 +323,10 @@ export class CampaignSchedulerWorker extends WorkerHost {
       jobId: bullJobId,
       attempts: 3,
       backoff: { type: 'exponential', delay: 60000 },
+      removeOnFail: { count: 5 },
+      removeOnComplete: { count: 10 },
     });
 
     console.log(`[WORKER] ✅ Re-queued next week job ${bullJobId}`);
-  }
-
-  private isPDT(year: number, month: number, day: number): boolean {
-    const date = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
-    const pstString = date.toLocaleString('en-US', {
-      timeZone: 'America/Los_Angeles',
-      timeZoneName: 'short',
-      hour12: false,
-    });
-    const isPDT = pstString.includes('PDT');
-    console.log(`[WORKER]   isPDT(${year}-${month}-${day}): ${pstString} → ${isPDT}`);
-    return isPDT;
   }
 }

@@ -4,3 +4,4 @@ export const REFRESH_BUFFER_MS = 5 * 60 * 1000;         // 5 minutes
 export const REFRESH_JOB_DELAY_MS = AMAZON_TOKEN_TTL_MS - REFRESH_BUFFER_MS; // 55 
 
 export const TEST_REFRESH_DELAY_MS = 10 * 1000; // 10 seconds
+export const TARGET_TZ = 'America/Los_Angeles';

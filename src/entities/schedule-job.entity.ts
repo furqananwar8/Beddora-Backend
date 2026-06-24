@@ -28,14 +28,17 @@ export class ScheduleJob {
   action?: 'ENABLE' | 'PAUSE';
 
   @Property({ default: 'pending' })
-  status?: 'pending' | 'completed' | 'failed' | 'cancelled' = 'pending';
+  status?: 'pending' | 'completed' | 'failed' | 'cancelled' | 'processing' = 'pending';
 
   @Property({ nullable: true })
   completedAt?: Date;
 
   @Property({ nullable: true })
-  errorMessage?: string;
+  errorMessage?: string | null;
 
   @Property({ onCreate: () => new Date(), nullable: true })
   createdAt?: Date = new Date();
+
+  @Property({ onCreate: () => new Date(), onUpdate: () => new Date() })
+  updatedAt?: Date = new Date();
 }
