@@ -4,7 +4,7 @@ import { CampaignSchedule } from 'src/entities/campaign-schedule.entity';
 import { ScheduleJob } from 'src/entities/schedule-job.entity';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import { toZonedTime, fromZonedTime } from 'date-fns-tz';
+import { toZonedTime, fromZonedTime, format } from 'date-fns-tz';
 import { TARGET_TZ } from 'src/common/constants/bullmq.constant';
 
 interface TimeSlot {
@@ -425,11 +425,17 @@ export class ScheduleExpanderService {
     
     // Build endAt based on startAt's PDT date, not recalculated
     const startPST = toZonedTime(startAt, TARGET_TZ);
-    const endPST = new Date(startPST);
-    endPST.setHours(endHour, endMin, 0, 0);
-    
+    const endPST = new Date(
+      startPST.getFullYear(),
+      startPST.getMonth(),
+      startPST.getDate(),
+      endHour,
+      endMin,
+      0,
+      0
+    );
     let endAt = fromZonedTime(endPST, TARGET_TZ);
-    
+   
     // Only add 24h if end is before start (midnight span)
     if (endAt <= startAt) {
       endAt = new Date(endAt.getTime() + 24 * 60 * 60 * 1000);
@@ -438,29 +444,43 @@ export class ScheduleExpanderService {
     return { startAt, endAt };
   }
 
-  private nextOccurrence(dayOfWeek: number, timeStr: string, baseDate: Date = new Date()): Date {
-    const zonedNow = toZonedTime(baseDate, TARGET_TZ);
-
+  private nextOccurrence(
+    dayOfWeek: number,
+    timeStr: string,
+    baseDate: Date = new Date()
+  ): Date {
     const [hours, minutes] = timeStr.split(':').map(Number);
 
-    const candidate = new Date(zonedNow);
-    candidate.setHours(hours, minutes, 0, 0);
+    // Work entirely in wall-clock LA time using date-fns-tz correctly
+    const zonedNow = toZonedTime(baseDate, TARGET_TZ);
 
-    this.logger.log(`[EXPANDER]   nextOccurrence: zonedNow=${zonedNow.toISOString()}, candidate=${candidate.toISOString()}, targetDay=${dayOfWeek}, currentDay=${candidate.getDay()}`);
+    // Build candidate as a plain struct in LA time, then convert
+    const candidateZoned = new Date(
+      zonedNow.getFullYear(),
+      zonedNow.getMonth(),
+      zonedNow.getDate(),
+      hours,
+      minutes,
+      0,
+      0
+    );
 
-    let daysUntil = dayOfWeek - candidate.getDay();
+    this.logger.log(
+      `[EXPANDER]   nextOccurrence: zonedNow=${format(zonedNow, 'yyyy-MM-dd HH:mm:ssxxx', { timeZone: TARGET_TZ })}`
+    );
+
+    let daysUntil = dayOfWeek - candidateZoned.getDay();
     if (daysUntil < 0) daysUntil += 7;
 
-    if (daysUntil === 0 && candidate.getTime() <= zonedNow.getTime() + 60000) {
+    if (daysUntil === 0 && fromZonedTime(candidateZoned, TARGET_TZ).getTime() <= baseDate.getTime() + 60000) {
       daysUntil = 7;
       this.logger.log(`[EXPANDER]   Slot already passed or too soon, pushing to next week`);
     }
 
-    candidate.setDate(candidate.getDate() + daysUntil);
+    candidateZoned.setDate(candidateZoned.getDate() + daysUntil);
 
-    this.logger.log(`[EXPANDER]   Candidate in target tz: ${candidate.toISOString()}`);
-
-    const utcResult = fromZonedTime(candidate, TARGET_TZ);
+    // NOW convert wall-clock LA time → UTC. date-fns-tz handles DST here.
+    const utcResult = fromZonedTime(candidateZoned, TARGET_TZ);
 
     this.logger.log(`[EXPANDER]   Converted to UTC: ${utcResult.toISOString()}`);
 
