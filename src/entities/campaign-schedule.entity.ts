@@ -21,6 +21,9 @@ export class CampaignSchedule {
   @Property()
   dayOfWeek!: number;
 
+  @Property({ nullable: true })
+  campaignName?: string;
+
   @Property({ type: 'json' })
   timeSlots?: Array<{ startTime: string; endTime: string }>;
 

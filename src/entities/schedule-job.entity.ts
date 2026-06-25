@@ -24,6 +24,9 @@ export class ScheduleJob {
   @Property()
   jobType?: 'slot_start' | 'slot_end';
 
+  @Property({ nullable: true })
+  campaignName?: string;
+
   @Property()
   action?: 'ENABLE' | 'PAUSE';
 

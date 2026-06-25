@@ -29,4 +29,7 @@ export class CreateSchedulesDTO {
   @Type(() => ScheduleConfigDto)
   @IsOptional() // ← allow empty array for clear
   schedules!: ScheduleConfigDto[];
+
+  @IsOptional()
+  campaignName?: string;
 }

@@ -10,6 +10,7 @@ import {
   UseGuards,
   UnauthorizedException,
   BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import {
   ApiCookieAuth,
@@ -42,6 +43,9 @@ export class CampaignController {
     private readonly expander: ScheduleExpanderService,
     @InjectQueue('campaign-scheduler') private readonly schedulerQueue: Queue,
   ) {}
+
+  private readonly logger = new Logger(CampaignController.name);
+  
 
   private async getSessionToken(req: Request) {
     const sessionId = req.cookies?.[SESSION_COOKIE];
@@ -158,6 +162,7 @@ async listCampaigns(
       (session.region as string) || 'na',
       sessionId,
       body.schedules,
+      body.campaignName
     );
 
     return { 
@@ -233,6 +238,170 @@ async listCampaigns(
     return { repaired: result };
   }
 
+  @Get('scheduled-jobs')
+  @UseGuards(SessionAuthGuard)
+  @ApiCookieAuth('sid')
+  @ApiOperation({ summary: 'List all scheduled jobs across campaigns with pagination' })
+  @ApiQuery({ name: 'page', required: false, type: Number })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  @ApiQuery({ name: 'status', required: false, enum: ['pending', 'processing', 'completed', 'failed', 'cancelled'] })
+  @ApiQuery({ name: 'sortBy', required: false, enum: ['executeAt', 'createdAt', 'status'] })
+  @ApiQuery({ name: 'sortOrder', required: false, enum: ['asc', 'desc'] })
+  @ApiQuery({ name: 'campaignId', required: false, type: String })
+  async getAllScheduledJobs(
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('status') status?: string,
+    @Query('sortBy') sortBy?: string,
+    @Query('sortOrder') sortOrder?: 'asc' | 'desc',
+    @Query('campaignId') campaignId?: string,
+  ) {
+    const em = this.em.fork();
+    
+    const pageNum = Math.max(1, parseInt(page || '1', 10));
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit || '20', 10)));
+    const offset = (pageNum - 1) * limitNum;
+    
+    const where: any = {};
+    
+    // Optional filter by campaign
+    if (campaignId) {
+      where.campaignId = campaignId;
+    }
+    
+    if (status && ['pending', 'processing', 'completed', 'failed', 'cancelled'].includes(status)) {
+      where.status = status;
+    }
+    
+    const orderBy: any = {};
+    const sortField = sortBy || 'executeAt';
+    orderBy[sortField] = sortOrder || 'asc';
+    
+    const [jobs, total] = await em.findAndCount(ScheduleJob, where, {
+      orderBy,
+      limit: limitNum,
+      offset,
+      populate: ['schedule'],
+    });
+    
+    const totalPages = Math.ceil(total / limitNum);
+    
+    return {
+      data: jobs.map((j) => ({
+        id: j.id,
+        campaignId: j.campaignId,
+        campaignName: j.campaignName || j.schedule?.campaignName,
+        profileId: j.profileId,
+        region: j.region,
+        executeAt: j.executeAt,
+        jobType: j.jobType,
+        action: j.action,
+        status: j.status,
+        errorMessage: j.errorMessage,
+        createdAt: j.createdAt,
+        completedAt: j.completedAt,
+        schedule: j.schedule ? {
+          id: j.schedule.id,
+          dayOfWeek: j.schedule.dayOfWeek,
+          timeSlots: j.schedule.timeSlots,
+          action: j.schedule.action,
+          isActive: j.schedule.isActive,
+        } : null,
+      })),
+      meta: {
+        total,
+        page: pageNum,
+        limit: limitNum,
+        totalPages,
+        hasNext: pageNum < totalPages,
+        hasPrev: pageNum > 1,
+      },
+    };
+  }
+
+  @Delete('scheduled-jobs')
+  @UseGuards(SessionAuthGuard)
+  @ApiCookieAuth('sid')
+  @ApiOperation({ summary: 'Delete all future scheduled jobs across all campaigns' })
+  @ApiQuery({ name: 'campaignId', required: false, type: String })
+  async deleteAllFutureScheduledJobs(
+    @Query('campaignId') campaignId?: string,
+  ) {
+    const em = this.em.fork();
+    const now = new Date();
+    
+    const where: any = {
+      executeAt: { $gt: now },
+    };
+    
+    if (campaignId) {
+      where.campaignId = campaignId;
+    }
+    
+    // Find all future jobs with their schedules loaded
+    const futureJobs = await em.find(ScheduleJob, where, {
+      populate: ['schedule'],
+    });
+    
+    // Collect unique schedules to check later
+    const schedulesToCheck = new Set<CampaignSchedule>();
+    
+    let deletedCount = 0;
+    
+    for (const job of futureJobs) {
+      // Collect schedule for later cleanup
+      if (job.schedule) {
+        schedulesToCheck.add(job.schedule);
+      }
+      
+      // Remove from BullMQ if pending
+      if (job.status === 'pending') {
+        try {
+          await this.schedulerQueue.remove(`schedule-${job.id}`);
+          this.logger.log(`[DELETE] Removed BullMQ job schedule-${job.id}`);
+        } catch (err) {
+          this.logger.warn(`[DELETE] BullMQ job schedule-${job.id} not found or already removed`);
+        }
+      }
+      
+      // Mark for deletion
+      em.remove(job);
+      deletedCount++;
+    }
+    
+    // Now check each affected schedule
+    for (const schedule of schedulesToCheck) {
+      // Refresh the collection to see remaining jobs after removal
+      await em.populate(schedule, ['jobs']);
+      const remainingJobs = schedule.jobs.getItems().filter((j: ScheduleJob) => 
+        !futureJobs.some(fj => fj.id === j.id)  // exclude jobs we're deleting
+      );
+      
+      const hasRemainingFutureJobs = remainingJobs.some((j: ScheduleJob) => j.executeAt && j.executeAt > now);
+      const hasPastJobs = remainingJobs.some((j: ScheduleJob) => j.executeAt && j.executeAt <= now);
+      
+      if (remainingJobs.length === 0) {
+        // No jobs left at all — delete the schedule
+        this.logger.log(`[DELETE] Schedule ${schedule.id} has no jobs left, deleting`);
+        em.remove(schedule);
+      } else if (!hasRemainingFutureJobs) {
+        // Only past jobs remain — mark inactive, don't delete (audit trail)
+        this.logger.log(`[DELETE] Schedule ${schedule.id} has only past jobs, marking inactive`);
+        schedule.isActive = false;
+        schedule.updatedAt = new Date();
+      } else {
+        // Still has future jobs (not part of this deletion) — keep active
+        this.logger.log(`[DELETE] Schedule ${schedule.id} still has future jobs, keeping active`);
+      }
+    }
+    
+    await em.flush();
+    
+    return {
+      message: `Deleted ${deletedCount} future scheduled jobs${campaignId ? ` for campaign ${campaignId}` : ' across all campaigns'}`,
+      deletedCount,
+    };
+  }
   // Add temporarily to your AuthController or a test controller
   // @Post('test/fail-job')
   // @ApiOperation({ summary: 'Test job failure email (dev only)' })

@@ -16,6 +16,7 @@ interface ScheduleConfig {
   dayOfWeek: number;
   timeSlots: TimeSlot[];
   action: 'ENABLED' | 'PAUSED';
+  campaignName?: string;
 }
 
 interface SyncResult {
@@ -82,6 +83,7 @@ export class ScheduleExpanderService {
     region: string,
     sessionId: string,
     incoming: ScheduleConfig[],
+    campaignName?: string,
   ): Promise<SyncResult> {
     this.logger.log(`[EXPANDER] ════════════════════════════════════════════════════════`);
     this.logger.log(`[EXPANDER] syncSchedules called`);
@@ -113,7 +115,7 @@ export class ScheduleExpanderService {
     const create = this.extractNew(incoming, keep);
     this.logger.log(`[EXPANDER] New configs to create: ${create.length}`);
 
-    const created = await this.create(em, campaignId, profileId, region, sessionId, create);
+    const created = await this.create(em, campaignId, profileId, region, sessionId, create, campaignName);
 
     await em.flush();
 
@@ -347,10 +349,11 @@ export class ScheduleExpanderService {
     region: string,
     sessionId: string,
     configs: ScheduleConfig[],
+    campaignName?: string,
   ): Promise<number> {
     if (configs.length === 0) return 0;
 
-    const jobs = this.buildJobs(em, campaignId, profileId, region, sessionId, configs);
+    const jobs = this.buildJobs(em, campaignId, profileId, region, sessionId, configs, campaignName);
     await em.flush();
     await this.enqueue(jobs);
 
@@ -364,6 +367,7 @@ export class ScheduleExpanderService {
     region: string,
     sessionId: string,
     configs: ScheduleConfig[],
+    campaignName?: string
   ): Array<{ job: ScheduleJob; delay: number }> {
     const out: Array<{ job: ScheduleJob; delay: number }> = [];
 
@@ -383,6 +387,7 @@ export class ScheduleExpanderService {
           timeSlots: [slot],
           action: cfg.action,
           isActive: true,
+          campaignName: campaignName || cfg.campaignName
         });
         em.persist(schedule);
         this.logger.log(`[EXPANDER]   Created CampaignSchedule id=${schedule.id} with slot [${slot.startTime}-${slot.endTime}]`);
@@ -392,8 +397,8 @@ export class ScheduleExpanderService {
         this.logger.log(`[EXPANDER]   startAt (UTC)=${startAt.toISOString()} → PST=${startAt.toLocaleString('en-US', { timeZone: TARGET_TZ })}`);
         this.logger.log(`[EXPANDER]   endAt (UTC)=${endAt.toISOString()} → PST=${endAt.toLocaleString('en-US', { timeZone: TARGET_TZ })}`);
 
-        const startJob = this.makeJob(em, schedule, campaignId, profileId, region, startAt, 'slot_start', startAction);
-        const endJob = this.makeJob(em, schedule, campaignId, profileId, region, endAt, 'slot_end', endAction);
+        const startJob = this.makeJob(em, schedule, campaignId, profileId, region, startAt, 'slot_start', startAction, campaignName);
+        const endJob = this.makeJob(em, schedule, campaignId, profileId, region, endAt, 'slot_end', endAction, campaignName);
 
         const startDelay = startAt.getTime() - Date.now();
         const endDelay = endAt.getTime() - Date.now();
@@ -471,6 +476,7 @@ export class ScheduleExpanderService {
     executeAt: Date,
     jobType: 'slot_start' | 'slot_end',
     action: 'ENABLE' | 'PAUSE',
+    campaignName?: string
   ): ScheduleJob {
     const job = em.create(ScheduleJob, {
       schedule,
@@ -481,6 +487,7 @@ export class ScheduleExpanderService {
       jobType,
       action,
       status: 'pending',
+      campaignName
     });
     em.persist(job);
     return job;
