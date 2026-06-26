@@ -1,6 +1,6 @@
 
 export interface EmailTemplate {
-    to: string;
+    to: string | string[];
     subject: string;
     text?: string;
     template?: string;

@@ -211,9 +211,20 @@ export class CampaignSchedulerWorker extends WorkerHost {
     err: Error,
     attemptsMade: number,
   ): Promise<void> {
-    const adminEmail = this.configService.get<string>('ADMIN_EMAIL');
-    if (!adminEmail) {
+    const adminEmailsRaw = this.configService.get<string>('ADMIN_EMAIL');
+    if (!adminEmailsRaw) {
       this.logger.log(`[WORKER-EVENT] ⚠️ ADMIN_EMAIL not configured, skipping failure notification`);
+      return;
+    }
+
+    // Split by comma and trim whitespace
+    const adminEmails = adminEmailsRaw
+      .split(',')
+      .map(e => e.trim())
+      .filter(Boolean);
+
+    if (adminEmails.length === 0) {
+      this.logger.log(`[WORKER-EVENT] ⚠️ No valid admin emails found`);
       return;
     }
 
@@ -224,8 +235,8 @@ export class CampaignSchedulerWorker extends WorkerHost {
     const scheduleId = scheduleJob.schedule?.id ?? 'N/A' as any;
 
     try {
-      await this.emailService.sendFailedJobEmail({
-        to: adminEmail,
+      this.emailService.sendFailedJobEmail({
+        to: adminEmails, // <-- string array
         subject: `Campaign Scheduler Failure: ${campaignId}`,
         template: 'job-failed',
         context: {
@@ -239,7 +250,7 @@ export class CampaignSchedulerWorker extends WorkerHost {
           timestamp: new Date().toISOString(),
         },
       });
-      this.logger.log(`[WORKER-EVENT] ✅ Failure email sent to admin: ${adminEmail}`);
+      this.logger.log(`[WORKER-EVENT] ✅ Failure email sent to admins: ${adminEmails.join(', ')}`);
     } catch (emailErr: any) {
       this.logger.log(`[WORKER-EVENT] ❌ Failed to send admin email: ${emailErr.message}`);
     }
