@@ -248,6 +248,7 @@ async listCampaigns(
   @ApiQuery({ name: 'sortBy', required: false, enum: ['executeAt', 'createdAt', 'status'] })
   @ApiQuery({ name: 'sortOrder', required: false, enum: ['asc', 'desc'] })
   @ApiQuery({ name: 'campaignId', required: false, type: String })
+  @ApiQuery({ name: 'search', required: false, type: String, description: 'Search by campaign name' })
   async getAllScheduledJobs(
     @Query('page') page?: string,
     @Query('limit') limit?: string,
@@ -255,6 +256,7 @@ async listCampaigns(
     @Query('sortBy') sortBy?: string,
     @Query('sortOrder') sortOrder?: 'asc' | 'desc',
     @Query('campaignId') campaignId?: string,
+    @Query('search') search?: string,
   ) {
     const em = this.em.fork();
     
@@ -271,6 +273,11 @@ async listCampaigns(
     
     if (status && ['pending', 'processing', 'completed', 'failed', 'cancelled'].includes(status)) {
       where.status = status;
+    }
+
+    // Search by campaign name (case-insensitive)
+    if (search?.trim()) {
+      where.campaignName = { $ilike: `%${search.trim()}%` };
     }
     
     const orderBy: any = {};
