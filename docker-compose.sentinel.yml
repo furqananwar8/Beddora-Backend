@@ -1,0 +1,106 @@
+services:
+  sentinel-redis-master:
+    image: redis:7-alpine
+    container_name: sentinel-redis-master
+    hostname: sentinel-redis-master
+    command: redis-server --appendonly yes --dir /data
+    volumes:
+      - sentinel-master-data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - redis-sentinel
+
+  sentinel-redis-replica:
+    image: redis:7-alpine
+    container_name: sentinel-redis-replica
+    hostname: sentinel-redis-replica
+    command: redis-server --replicaof sentinel-redis-master 6379 --appendonly yes --dir /data
+    volumes:
+      - sentinel-replica-data:/data
+    depends_on:
+      - sentinel-redis-master
+    ports:
+      - "6391:6379"
+    networks:
+      - redis-sentinel
+
+  sentinel-1:
+    image: redis:7-alpine
+    container_name: sentinel-node-1
+    command: >
+      sh -c "
+        mkdir -p /etc/redis &&
+        echo 'port 26379' > /etc/redis/sentinel.conf &&
+        echo 'sentinel resolve-hostnames yes' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel announce-hostnames yes' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel monitor mymaster sentinel-redis-master 6379 2' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds mymaster 5000' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel failover-timeout mymaster 10000' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel parallel-syncs mymaster 1' >> /etc/redis/sentinel.conf &&
+        redis-sentinel /etc/redis/sentinel.conf
+      "
+    depends_on:
+      - sentinel-redis-master
+      - sentinel-redis-replica
+    ports:
+      - "26479:26379"
+    networks:
+      - redis-sentinel
+    restart: unless-stopped
+
+  sentinel-2:
+    image: redis:7-alpine
+    container_name: sentinel-node-2
+    command: >
+      sh -c "
+        mkdir -p /etc/redis &&
+        echo 'port 26379' > /etc/redis/sentinel.conf &&
+        echo 'sentinel resolve-hostnames yes' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel announce-hostnames yes' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel monitor mymaster sentinel-redis-master 6379 2' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds mymaster 5000' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel failover-timeout mymaster 10000' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel parallel-syncs mymaster 1' >> /etc/redis/sentinel.conf &&
+        redis-sentinel /etc/redis/sentinel.conf
+      "
+    depends_on:
+      - sentinel-redis-master
+      - sentinel-redis-replica
+    ports:
+      - "26480:26379"
+    networks:
+      - redis-sentinel
+    restart: unless-stopped
+
+  sentinel-3:
+    image: redis:7-alpine
+    container_name: sentinel-node-3
+    command: >
+      sh -c "
+        mkdir -p /etc/redis &&
+        echo 'port 26379' > /etc/redis/sentinel.conf &&
+        echo 'sentinel resolve-hostnames yes' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel announce-hostnames yes' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel monitor mymaster sentinel-redis-master 6379 2' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds mymaster 5000' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel failover-timeout mymaster 10000' >> /etc/redis/sentinel.conf &&
+        echo 'sentinel parallel-syncs mymaster 1' >> /etc/redis/sentinel.conf &&
+        redis-sentinel /etc/redis/sentinel.conf
+      "
+    depends_on:
+      - sentinel-redis-master
+      - sentinel-redis-replica
+    ports:
+      - "26481:26379"
+    networks:
+      - redis-sentinel
+    restart: unless-stopped
+
+networks:
+  redis-sentinel:
+    driver: bridge
+
+volumes:
+  sentinel-master-data:
+  sentinel-replica-data:
