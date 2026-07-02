@@ -326,41 +326,42 @@ async listCampaigns(
     };
   }
 
-  @Delete('scheduled-jobs')
+ @Delete('scheduled-jobs')
   @UseGuards(SessionAuthGuard)
   @ApiCookieAuth('sid')
-  @ApiOperation({ summary: 'Delete all future scheduled jobs across all campaigns' })
+  @ApiOperation({ summary: 'Delete all future and failed scheduled jobs across all campaigns' })
   @ApiQuery({ name: 'campaignId', required: false, type: String })
   async deleteAllFutureScheduledJobs(
     @Query('campaignId') campaignId?: string,
   ) {
     const em = this.em.fork();
     const now = new Date();
-    
+
+    // ── 1. Single OR query: future jobs OR failed jobs ──
     const where: any = {
-      executeAt: { $gt: now },
+      $or: [
+        { executeAt: { $gt: now } },
+        { status: 'failed' },
+      ],
     };
-    
+
     if (campaignId) {
-      where.campaignId = campaignId;
+      where.campaignId = campaignId; // AND outside the $or
     }
-    
-    // Find all future jobs with their schedules loaded
-    const futureJobs = await em.find(ScheduleJob, where, {
+
+    const jobsToDelete = await em.find(ScheduleJob, where, {
       populate: ['schedule'],
     });
-    
-    // Collect unique schedules to check later
+
+    const deletedJobIds = new Set(jobsToDelete.map(j => j.id));
     const schedulesToCheck = new Set<CampaignSchedule>();
-    
     let deletedCount = 0;
-    
-    for (const job of futureJobs) {
-      // Collect schedule for later cleanup
+
+    for (const job of jobsToDelete) {
       if (job.schedule) {
         schedulesToCheck.add(job.schedule);
       }
-      
+
       // Remove from BullMQ if pending
       if (job.status === 'pending') {
         try {
@@ -370,42 +371,39 @@ async listCampaigns(
           this.logger.warn(`[DELETE] BullMQ job schedule-${job.id} not found or already removed`);
         }
       }
-      
-      // Mark for deletion
+
       em.remove(job);
       deletedCount++;
     }
-    
-    // Now check each affected schedule
+
+    // ── 2. Schedule cleanup ──
     for (const schedule of schedulesToCheck) {
-      // Refresh the collection to see remaining jobs after removal
       await em.populate(schedule, ['jobs']);
-      const remainingJobs = schedule.jobs.getItems().filter((j: ScheduleJob) => 
-        !futureJobs.some(fj => fj.id === j.id)  // exclude jobs we're deleting
+
+      const remainingJobs = schedule.jobs.getItems().filter(
+        (j: ScheduleJob) => !deletedJobIds.has(j.id)
       );
-      
-      const hasRemainingFutureJobs = remainingJobs.some((j: ScheduleJob) => j.executeAt && j.executeAt > now);
-      const hasPastJobs = remainingJobs.some((j: ScheduleJob) => j.executeAt && j.executeAt <= now);
-      
+
+      const hasRemainingFutureJobs = remainingJobs.some(
+        (j: ScheduleJob) => j.executeAt && j.executeAt > now
+      );
+
       if (remainingJobs.length === 0) {
-        // No jobs left at all — delete the schedule
         this.logger.log(`[DELETE] Schedule ${schedule.id} has no jobs left, deleting`);
         em.remove(schedule);
       } else if (!hasRemainingFutureJobs) {
-        // Only past jobs remain — mark inactive, don't delete (audit trail)
         this.logger.log(`[DELETE] Schedule ${schedule.id} has only past jobs, marking inactive`);
         schedule.isActive = false;
         schedule.updatedAt = new Date();
       } else {
-        // Still has future jobs (not part of this deletion) — keep active
         this.logger.log(`[DELETE] Schedule ${schedule.id} still has future jobs, keeping active`);
       }
     }
-    
+
     await em.flush();
-    
+
     return {
-      message: `Deleted ${deletedCount} future scheduled jobs${campaignId ? ` for campaign ${campaignId}` : ' across all campaigns'}`,
+      message: `Deleted ${deletedCount} scheduled jobs${campaignId ? ` for campaign ${campaignId}` : ' across all campaigns'}`,
       deletedCount,
     };
   }

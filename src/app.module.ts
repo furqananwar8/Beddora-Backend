@@ -9,7 +9,7 @@ import { SessionModule } from './modules/session/session.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { AMAZON_TOKEN_REFRESH } from './common/constants/bullmq.constant';
+import { AMAZON_PROFILE_TOKEN_REFRESH, AMAZON_TOKEN_REFRESH } from './common/constants/bullmq.constant';
 import { CampaignModule } from './modules/campaign/campaign.module';
 import { EmailModule } from './modules/email/email.module';
 import { UserModule } from './modules/user/user.module';
@@ -34,6 +34,10 @@ import { UserModule } from './modules/user/user.module';
 
     BullModule.registerQueue({
       name: AMAZON_TOKEN_REFRESH,
+    }),
+
+    BullModule.registerQueue({
+      name: AMAZON_PROFILE_TOKEN_REFRESH,
     }),
 
     MikroOrmModule.forRootAsync({

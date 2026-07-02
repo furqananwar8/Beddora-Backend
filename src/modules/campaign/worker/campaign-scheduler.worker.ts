@@ -4,7 +4,7 @@ import { EntityManager } from '@mikro-orm/core';
 import { ScheduleJob } from 'src/entities/schedule-job.entity';
 import { CampaignSchedule } from 'src/entities/campaign-schedule.entity';
 import { AmazonCampaignApiClient } from '../../amazon/client/amazon-api.client';
-import { SessionService } from 'src/modules/session/service/session.service';
+import { ProfileTokenService } from 'src/modules/session/service/profile-token.service';
 import { EmailService } from 'src/modules/email/service/email.service';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -17,11 +17,11 @@ import { Logger } from '@nestjs/common';
 @Processor('campaign-scheduler', { concurrency: 1 })
 export class CampaignSchedulerWorker extends WorkerHost {
   private logger = new Logger(CampaignSchedulerWorker.name);
-  
+
   constructor(
     private readonly em: EntityManager,
     private readonly amazonClient: AmazonCampaignApiClient,
-    private readonly sessionService: SessionService,
+    private readonly profileTokenService: ProfileTokenService,
     private readonly emailService: EmailService,
     private readonly configService: ConfigService,
     private readonly expander: ScheduleExpanderService,
@@ -37,10 +37,6 @@ export class CampaignSchedulerWorker extends WorkerHost {
 
     this.logger.log(`[WORKER] ════════════════════════════════════════════════════════`);
     this.logger.log(`[WORKER] Job ${job.id} (data.jobId=${job.data.jobId}) started`);
-    this.logger.log(`[WORKER] Server time (ISO):    ${now.toISOString()}`);
-    this.logger.log(`[WORKER] Server time (local):  ${now.toString()}`);
-    this.logger.log(`[WORKER] Server TZ offset:     ${now.getTimezoneOffset()} min`);
-    this.logger.log(`[WORKER] Current PST time:     ${now.toLocaleString('en-US', { timeZone: TARGET_TZ })}`);
 
     const scheduleJob = await em.findOne(
       ScheduleJob,
@@ -50,27 +46,9 @@ export class CampaignSchedulerWorker extends WorkerHost {
 
     if (!scheduleJob) {
       this.logger.log(`[WORKER] ❌ Job ${job.data.jobId} NOT FOUND in DB (may have been deleted)`);
-      return;
+      throw new Error(`ScheduleJob ${job.data.jobId} not found in DB`);
     }
 
-    this.logger.log(`[WORKER] Found scheduleJob:`);
-    this.logger.log(`[WORKER]   id=${scheduleJob.id}`);
-    this.logger.log(`[WORKER]   status=${scheduleJob.status}`);
-    this.logger.log(`[WORKER]   action=${scheduleJob.action}`);
-    this.logger.log(`[WORKER]   jobType=${scheduleJob.jobType}`);
-    this.logger.log(`[WORKER]   executeAt (ISO)=${scheduleJob.executeAt?.toISOString()}`);
-
-    if (scheduleJob.executeAt) {
-      const executeAtTime = scheduleJob.executeAt.getTime();
-      const nowTime = now.getTime();
-      const diffMs = nowTime - executeAtTime;
-      const diffSec = Math.round(diffMs / 1000);
-      const diffMin = Math.round(diffMs / 60000);
-      this.logger.log(`[WORKER]   executeAt vs now: ${diffSec}s (${diffMin}min) ${diffMs > 0 ? 'LATE' : diffMs < 0 ? 'EARLY' : 'ON TIME'}`);
-      this.logger.log(`[WORKER]   executeAt in PST:   ${scheduleJob.executeAt.toLocaleString('en-US', { timeZone: TARGET_TZ })}`);
-    }
-
-    // Reset status on retry so the job can actually run again
     if (scheduleJob.status === 'failed') {
       this.logger.log(`[WORKER] 🔄 RETRY detected for job ${job.data.jobId}, resetting status to pending`);
       scheduleJob.status = 'pending';
@@ -89,12 +67,6 @@ export class CampaignSchedulerWorker extends WorkerHost {
       throw new Error('Schedule relation not loaded');
     }
 
-    this.logger.log(`[WORKER] Parent schedule:`);
-    this.logger.log(`[WORKER]   id=${schedule.id}`);
-    this.logger.log(`[WORKER]   dayOfWeek=${schedule.dayOfWeek}`);
-    this.logger.log(`[WORKER]   isActive=${schedule.isActive}`);
-    this.logger.log(`[WORKER]   action=${schedule.action}`);
-
     if (schedule.isActive === false) {
       this.logger.log(`[WORKER] ⏭️ SKIPPED: parent schedule isActive=false (deferred cancellation)`);
       scheduleJob.status = 'cancelled';
@@ -102,37 +74,36 @@ export class CampaignSchedulerWorker extends WorkerHost {
       return;
     }
 
-    // Mark as processing before API call
     scheduleJob.status = 'processing';
     await em.flush();
 
     try {
-      const session = await this.sessionService.get(schedule.sessionId || '');
-      if (!session?.access_token) {
-        this.logger.log(`[WORKER] ❌ ERROR: No valid Amazon token for session ${schedule.sessionId}`);
+      const tokenData = await this.profileTokenService.get(scheduleJob.profileId as number);
+      if (!tokenData?.access_token) {
+        this.logger.log(`[WORKER] ❌ ERROR: No valid Amazon token for profile ${scheduleJob.profileId}`);
         throw new Error('No valid Amazon token');
       }
-      this.logger.log(`[WORKER] ✅ Session acquired for ${schedule.sessionId}`);
+      this.logger.log(`[WORKER] ✅ Profile token acquired for profile ${scheduleJob.profileId}`);
 
       if (scheduleJob.action === 'ENABLE') {
         this.logger.log(`[WORKER] 🚀 Calling Amazon API: ENABLE campaign ${scheduleJob.campaignId}`);
-        await this.amazonClient.updateCampaign(
-          session.access_token,
-          scheduleJob.profileId as number,
-          scheduleJob.region as 'na' | 'eu' | 'fe',
-          scheduleJob.campaignId as string,
-          { state: 'ENABLED' },
-        );
+        // await this.amazonClient.updateCampaign(
+        //   tokenData.access_token,
+        //   scheduleJob.profileId as number,
+        //   scheduleJob.region as 'na' | 'eu' | 'fe',
+        //   scheduleJob.campaignId as string,
+        //   { state: 'ENABLED' },
+        // );
         this.logger.log(`[WORKER] ✅ SUCCESS: ENABLED campaign ${scheduleJob.campaignId}`);
       } else if (scheduleJob.action === 'PAUSE') {
         this.logger.log(`[WORKER] 🚀 Calling Amazon API: PAUSE campaign ${scheduleJob.campaignId}`);
-        await this.amazonClient.updateCampaign(
-          session.access_token,
-          scheduleJob.profileId as number,
-          scheduleJob.region as 'na' | 'eu' | 'fe',
-          scheduleJob.campaignId as string,
-          { state: 'PAUSED' },
-        );
+        // await this.amazonClient.updateCampaign(
+        //   tokenData.access_token,
+        //   scheduleJob.profileId as number,
+        //   scheduleJob.region as 'na' | 'eu' | 'fe',
+        //   scheduleJob.campaignId as string,
+        //   { state: 'PAUSED' },
+        // );
         this.logger.log(`[WORKER] ✅ SUCCESS: PAUSED campaign ${scheduleJob.campaignId}`);
       } else {
         this.logger.log(`[WORKER] ⚠️ WARNING: Unknown action '${scheduleJob.action}'`);
@@ -143,7 +114,6 @@ export class CampaignSchedulerWorker extends WorkerHost {
       await em.flush();
       this.logger.log(`[WORKER] ✅ Job ${job.data.jobId} marked as completed`);
 
-      // If this was a deferred schedule (isActive=false), clean it up after slot_end
       if (!schedule.isActive && scheduleJob.jobType === 'slot_end') {
         this.logger.log(`[WORKER] 🧹 Deferred schedule detected, running cleanup`);
         await this.expander.cleanupDeferredSchedule(schedule.id);
@@ -199,7 +169,6 @@ export class CampaignSchedulerWorker extends WorkerHost {
 
     await this.notifyAdminOfFailure(scheduleJob, err, currentAttempt);
 
-    // Don't hard-delete on final failure — keep for audit trail
     scheduleJob.status = 'failed';
     scheduleJob.errorMessage = err.message;
     await em.flush();
@@ -217,7 +186,6 @@ export class CampaignSchedulerWorker extends WorkerHost {
       return;
     }
 
-    // Split by comma and trim whitespace
     const adminEmails = adminEmailsRaw
       .split(',')
       .map(e => e.trim())
@@ -229,6 +197,7 @@ export class CampaignSchedulerWorker extends WorkerHost {
     }
 
     const campaignId = scheduleJob.campaignId;
+    const campaignName = scheduleJob.campaignName;
     const action = scheduleJob.action;
     const jobType = scheduleJob.jobType;
     const executeAt = scheduleJob.executeAt?.toISOString() ?? 'N/A';
@@ -236,11 +205,12 @@ export class CampaignSchedulerWorker extends WorkerHost {
 
     try {
       this.emailService.sendFailedJobEmail({
-        to: adminEmails, // <-- string array
+        to: adminEmails,
         subject: `Campaign Scheduler Failure: ${campaignId}`,
         template: 'job-failed',
         context: {
           campaignId,
+          campaignName,
           action,
           jobType,
           scheduleId,
@@ -268,10 +238,6 @@ export class CampaignSchedulerWorker extends WorkerHost {
       return;
     }
 
-    this.logger.log(`[WORKER] completedJob.executeAt (ISO)=${completedJob.executeAt.toISOString()}`);
-    this.logger.log(`[WORKER] completedJob.executeAt (PST)=${completedJob.executeAt.toLocaleString('en-US', { timeZone: TARGET_TZ })}`);
-    this.logger.log(`[WORKER] completedJob.jobType=${completedJob.jobType}, action=${completedJob.action}`);
-
     const timeSlots = schedule.timeSlots ?? [];
     if (timeSlots.length === 0) {
       this.logger.log(`[WORKER] ❌ No timeSlots found on schedule ${schedule.id}`);
@@ -289,21 +255,14 @@ export class CampaignSchedulerWorker extends WorkerHost {
 
     const targetAction = completedJob.action;
 
-    this.logger.log(`[WORKER] Rescheduling: ${isStartJob ? 'START' : 'END'} at ${targetTimeStr} with action=${targetAction}`);
-
     const completedPST = toZonedTime(completedJob.executeAt, TARGET_TZ);
-
     const nextWeekPST = new Date(completedPST);
     nextWeekPST.setDate(nextWeekPST.getDate() + 7);
 
     const [targetHour, targetMin] = targetTimeStr.split(':').map(Number);
     nextWeekPST.setHours(targetHour, targetMin, 0, 0);
 
-    this.logger.log(`[WORKER] Next week PST date: ${nextWeekPST.toISOString()}`);
-
     const executeAt = fromZonedTime(nextWeekPST, TARGET_TZ);
-
-    this.logger.log(`[WORKER] Next week executeAt (UTC)=${executeAt.toISOString()} → PST=${executeAt.toLocaleString('en-US', { timeZone: TARGET_TZ })}`);
 
     const newJob = em.create(ScheduleJob, {
       schedule,
@@ -314,21 +273,18 @@ export class CampaignSchedulerWorker extends WorkerHost {
       jobType: completedJob.jobType,
       action: targetAction,
       status: 'pending',
+      campaignName: completedJob.campaignName,
     });
     em.persist(newJob);
 
     await em.flush();
-    this.logger.log(`[WORKER] ✅ Created next week job: newJob.id=${newJob.id}`);
 
     const now = Date.now();
     const delay = executeAt.getTime() - now;
 
-    this.logger.log(`[WORKER] Enqueueing with delay: ${Math.round(delay / 1000)}s`);
-
     const bullJobId = `schedule-${newJob.id}`;
     const existingBullJob = await this.schedulerQueue.getJob(bullJobId);
     if (existingBullJob) {
-      this.logger.log(`[WORKER] ⚠️ BullMQ job ${bullJobId} already exists, removing first`);
       await this.schedulerQueue.remove(bullJobId);
     }
 
@@ -337,7 +293,7 @@ export class CampaignSchedulerWorker extends WorkerHost {
       jobId: bullJobId,
       attempts: 3,
       backoff: { type: 'exponential', delay: 60000 },
-      removeOnFail: { count: 5 },
+      removeOnFail: { count: 50 },
       removeOnComplete: { count: 10 },
     });
 

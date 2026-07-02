@@ -11,6 +11,9 @@ export class User {
   @Property()
   name?: string;
 
+  @Property({ unique: true })
+  email?: string;
+
   @Property({ nullable: true })
   lastLoginAt?: Date;
 

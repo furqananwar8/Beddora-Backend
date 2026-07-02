@@ -7,15 +7,15 @@ export interface EmailTemplate {
     context: {
         inviteUrl?: string;
         companyName?: string;
+        campaignName?: string;
         name?: string;
         campaignId?: string;
-         action?: string;
-          jobType?: string;
-          scheduleId?: string;
-          executeAt?: string;
-          errorMessage?: string,
-          attemptsMade?: number,
-          timestamp?: string,
-  
+        action?: string;
+        jobType?: string;
+        scheduleId?: string;
+        executeAt?: string;
+        errorMessage?: string,
+        attemptsMade?: number,
+        timestamp?: string,
     };
 }

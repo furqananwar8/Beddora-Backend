@@ -14,11 +14,12 @@ import type { Response, Request } from 'express';
 import { ApiTags, ApiOperation, ApiResponse, ApiQuery, ApiCookieAuth } from '@nestjs/swagger';
 import { AuthService } from '../service/auth.service';
 import { SessionService } from 'src/modules/session/service/session.service';
+import { ProfileTokenService } from 'src/modules/session/service/profile-token.service';
 import { EntityManager } from '@mikro-orm/core';
 import { User } from 'src/entities/user.entity';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import { AMAZON_TOKEN_REFRESH, REFRESH_JOB_DELAY_MS } from 'src/common/constants/bullmq.constant';
+import { AMAZON_PROFILE_TOKEN_REFRESH, AMAZON_TOKEN_REFRESH, REFRESH_JOB_DELAY_MS } from 'src/common/constants/bullmq.constant';
 import { ConfigService } from '@nestjs/config';
 import { SessionAuthGuard } from 'src/guards/SessionAuth.guard';
 import { EXPIRES_IN_30DAYS, EXPIRES_IN_30MIN, SESSION_COOKIE } from 'src/common/constants/session.constant';
@@ -32,21 +33,22 @@ import { InvitedUser } from 'src/entities/invited-user.entity';
 export class AuthController {
   private readonly isProd: boolean = false;
   constructor(
-    private em: EntityManager, 
-    private authService: AuthService, 
+    private em: EntityManager,
+    private authService: AuthService,
     private sessionService: SessionService,
+    private profileTokenService: ProfileTokenService,
     @InjectQueue(AMAZON_TOKEN_REFRESH) private readonly tokenRefreshQueue: Queue,
+    @InjectQueue(AMAZON_PROFILE_TOKEN_REFRESH) private readonly profileTokenRefreshQueue: Queue,
     private readonly configService: ConfigService,
     private readonly httpService: HttpService
   ) {
-     this.isProd = process.env.NODE_ENV === 'production';
+    this.isProd = process.env.NODE_ENV === 'production';
   }
-  
+
   @Get('amazon/login')
   @ApiOperation({ summary: 'Initiate Amazon OAuth login' })
   @ApiCookieAuth('sid')
   @ApiResponse({ status: 200, description: 'Amazon OAuth URL' })
-
   async amazonLogin(
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
@@ -54,7 +56,6 @@ export class AuthController {
     const state = crypto.randomUUID();
     const existingSessionId = req.cookies?.[SESSION_COOKIE];
 
-    // Clean up any existing session/cookie
     if (existingSessionId) {
       await this.sessionService.delete(existingSessionId);
       res.clearCookie(SESSION_COOKIE, {
@@ -79,10 +80,8 @@ export class AuthController {
       EXPIRES_IN_30MIN,
     );
 
-    // Encode sessionId + state in state parameter for callback retrieval
     const encodedState = Buffer.from(JSON.stringify({ state, sessionId: newSessionId })).toString('base64url');
 
-    // Set cookie for same-site requests (optional, won't work on cross-site redirect)
     res.cookie(SESSION_COOKIE, newSessionId, {
       httpOnly: true,
       sameSite: this.isProd ? 'none' : 'lax',
@@ -96,7 +95,7 @@ export class AuthController {
       response_type: 'code',
       redirect_uri: this.configService.getOrThrow('AMAZON_REDIRECT_URI'),
       scope: 'profile advertising::campaign_management',
-      state: encodedState,  // ← Contains both state and sessionId
+      state: encodedState,
     });
 
     return { url: `https://www.amazon.com/ap/oa?${params.toString()}` };
@@ -115,6 +114,7 @@ export class AuthController {
 
     let state: string;
     let sessionId: string;
+    let mappedProfiles: any;
     try {
       const decoded = JSON.parse(Buffer.from(encodedState, 'base64url').toString());
       state = decoded.state;
@@ -129,18 +129,13 @@ export class AuthController {
     if (!session) throw new UnauthorizedException('Session expired');
     if (state !== session.oauthState) throw new UnauthorizedException('Invalid OAuth state');
 
-    // Exchange code for tokens
     const {
       sessionId: finalSessionId,
       expiresIn,
       access_token,
+      refresh_token,
       email: amazonEmail,
     } = await this.authService.exchangeCodeForTokens(code, sessionId);
-
-    // Fetch Amazon Advertising profiles
-    let profileId: number | undefined;
-    let region: 'na' | 'eu' | 'fe' = 'na';
-    let countryCode: string | undefined;
 
     try {
       const clientId = this.configService.getOrThrow('AMAZON_CLIENT_ID');
@@ -164,7 +159,7 @@ export class AuthController {
         const euCountries = ['GB', 'DE', 'FR', 'IT', 'ES', 'NL', 'AE', 'SA', 'SE', 'PL', 'TR', 'BE', 'EG'];
         const feCountries = ['JP', 'AU', 'IN', 'SG'];
 
-        const mappedProfiles = profiles.map((p) => {
+        mappedProfiles = profiles.map((p) => {
           let region: 'na' | 'eu' | 'fe' = 'na';
           if (euCountries.includes(p.countryCode)) region = 'eu';
           else if (feCountries.includes(p.countryCode)) region = 'fe';
@@ -191,6 +186,27 @@ export class AuthController {
           },
           expiresIn - 60,
         );
+
+        const user = await this.em.findOne(User, { email: amazonEmail });
+        await this.profileTokenService.create(
+          mappedProfiles[0].profileId,
+          {
+            access_token,
+            refresh_token,
+            expires_at: Date.now() + expiresIn * 1000,
+            region: mappedProfiles[0].region,
+            countryCode: mappedProfiles[0].countryCode,
+            email: amazonEmail,
+            userId: String(user?.id ?? ''),
+          },
+          expiresIn - 60,
+        );
+
+        await this.tokenRefreshQueue.add(
+          'refresh-service',
+          { profileId: mappedProfiles[0].profileId },
+          { delay: REFRESH_JOB_DELAY_MS },
+        );
       }
     } catch (e: any) {
       return res.status(200).json({
@@ -200,37 +216,37 @@ export class AuthController {
       });
     }
 
-    // Set cookie to the NEW authenticated session
     res.cookie(SESSION_COOKIE, finalSessionId, {
       httpOnly: true,
-      sameSite: 'lax',      // ← Required for cross-site redirect from Amazon
+      sameSite: 'lax',
       secure: this.isProd,
       maxAge: EXPIRES_IN_30DAYS,
       path: '/',
     });
 
-    this.tokenRefreshQueue.add(
-      'refresh',
-      { sessionId: finalSessionId },
-      { delay: REFRESH_JOB_DELAY_MS },
-    );
+    // Browser session refresh chain (dies on logout)
+    await this.tokenRefreshQueue.add('refresh', { sessionId: finalSessionId }, {
+      delay: REFRESH_JOB_DELAY_MS,
+    });
+
+    // Profile token refresh chain (survives logout)
+    await this.profileTokenRefreshQueue.add('refresh-service', { profileId: mappedProfiles[0].profileId }, {
+      delay: REFRESH_JOB_DELAY_MS,
+    });
 
     return res.json({
       success: true,
       sessionId: finalSessionId,
-      profileId: profileId ?? null,
-      region: profileId ? region : null,
+      profileId: null,
+      region: null,
     });
   }
 
   @Get('me')
   @UseGuards(SessionAuthGuard)
   @ApiCookieAuth('sid')
-  @ApiOperation({
-    summary: 'Validate current session',
-    description: 'Reads the sid cookie, checks session validity in Redis, and auto-refreshes the Amazon token if expiring soon.',
-  })
-  @ApiResponse({ status: 200, description: 'Session is valid', schema: { example: { authenticated: true } } })
+  @ApiOperation({ summary: 'Validate current session' })
+  @ApiResponse({ status: 200, description: 'Session is valid' })
   @ApiResponse({ status: 401, description: 'No session cookie or session expired' })
   async getSession(@Req() req: Request, @Res() res: Response) {
     const sessionId = req.cookies?.[SESSION_COOKIE];
@@ -240,24 +256,21 @@ export class AuthController {
     if (!session) throw new UnauthorizedException('Session expired');
 
     const user = await this.em.findOne(User, { id: parseInt(session.userId) });
-    
     if (!user) {
       await this.sessionService.delete(sessionId);
       res.clearCookie(SESSION_COOKIE);
       throw new UnauthorizedException('User not found');
     }
 
-    // Remove sensitive fields
     const finalUserOutput = { ...user };
     delete (finalUserOutput as any).amazonUserId;
 
-    // Check invited user record by email from session
-    const invitedRecord = await this.em.findOne(InvitedUser, { 
-      email: session.email?.toLowerCase() 
+    const invitedRecord = await this.em.findOne(InvitedUser, {
+      email: session.email?.toLowerCase(),
     });
 
-    return res.status(200).json({ 
-      message: "Profile retrieved successfully", 
+    return res.status(200).json({
+      message: 'Profile retrieved successfully',
       user: finalUserOutput,
       invitedBy: invitedRecord?.invitedBy ?? null,
     });
@@ -266,11 +279,8 @@ export class AuthController {
   @Post('logout')
   @UseGuards(SessionAuthGuard)
   @ApiCookieAuth('sid')
-  @ApiOperation({
-    summary: 'Logout',
-    description: 'Destroys the server-side session in Redis and clears the sid cookie.',
-  })
-  @ApiResponse({ status: 200, description: 'Logged out successfully', schema: { example: { success: true } } })
+  @ApiOperation({ summary: 'Logout' })
+  @ApiResponse({ status: 200, description: 'Logged out successfully' })
   async logout(@Req() req: Request, @Res() res: Response) {
     const sessionId = req.cookies?.[SESSION_COOKIE];
 
@@ -280,5 +290,19 @@ export class AuthController {
 
     res.clearCookie(SESSION_COOKIE);
     return res.status(200).json({ message: 'Logged user out successfully' });
+  }
+
+  @Post('disconnect-amazon')
+  @UseGuards(SessionAuthGuard)
+  @ApiOperation({ summary: 'Disconnect Amazon and cancel all scheduled jobs' })
+  async disconnectAmazon(@Req() req: Request) {
+    const sessionId = req.cookies?.[SESSION_COOKIE];
+    const session = await this.sessionService.get(sessionId);
+    if (!session?.profileId) {
+      throw new UnauthorizedException('No session found');
+    }
+
+    await this.profileTokenService.delete(session.profileId);
+    return { message: 'Amazon disconnected. Background scheduling stopped.' };
   }
 }
