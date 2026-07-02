@@ -13,25 +13,52 @@ import { AMAZON_PROFILE_TOKEN_REFRESH, AMAZON_TOKEN_REFRESH } from './common/con
 import { CampaignModule } from './modules/campaign/campaign.module';
 import { EmailModule } from './modules/email/email.module';
 import { UserModule } from './modules/user/user.module';
+import { ScheduleModule } from '@nestjs/schedule';
+import { HealthModule } from './modules/health/health.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    ScheduleModule.forRoot(),
     RedisModule,
+    HealthModule,
     EmailModule,
     BullModule.forRootAsync({
       imports: [ConfigModule],
-      useFactory: (config: ConfigService) => ({
-        connection: {
-          host: config.get('REDIS_HOST', 'localhost'),
-          port: config.get<number>('REDIS_PORT', 6379),
-          maxRetriesPerRequest: null,
-          enableReadyCheck: false,
-        },
-      }),
+      useFactory: (config: ConfigService) => {
+        const isSentinel = config.get('REDIS_SENTINEL_ENABLED') === 'true';
+
+        if (isSentinel) {
+          return {
+            connection: {
+              sentinels: [
+                {
+                  host: config.get('REDIS_SENTINEL_HOST_1'),
+                  port: config.get<number>('REDIS_SENTINEL_PORT_1', 26479),
+                },
+                {
+                  host: config.get('REDIS_SENTINEL_HOST_2'),
+                  port: config.get<number>('REDIS_SENTINEL_PORT_2', 26480),
+                },
+              ],
+              name: config.get('REDIS_SENTINEL_MASTER_NAME', 'mymaster'),
+              maxRetriesPerRequest: null,
+              enableReadyCheck: false,
+            },
+          };
+        }
+
+        return {
+          connection: {
+            host: config.get('REDIS_HOST', 'localhost'),
+            port: config.get<number>('REDIS_PORT', 6379),
+            maxRetriesPerRequest: null,
+            enableReadyCheck: false,
+          },
+        };
+      },
       inject: [ConfigService],
     }),
-
     BullModule.registerQueue({
       name: AMAZON_TOKEN_REFRESH,
     }),

@@ -15,6 +15,12 @@ export class ScheduleJob {
   @Property({ type: 'bigint' })
   profileId!: number; // or number
 
+  @Property({ nullable: true })
+  bullJobId?: string | null = null; 
+
+  @Property({ nullable: true, type: 'datetime' })
+  redisAlertSentAt?: Date | null;
+
   @Property()
   region?: string;
 
@@ -31,7 +37,7 @@ export class ScheduleJob {
   action?: 'ENABLE' | 'PAUSE';
 
   @Property({ default: 'pending' })
-  status?: 'pending' | 'completed' | 'failed' | 'cancelled' | 'processing' = 'pending';
+  status?: 'pending' | 'completed' | 'failed' | 'cancelled' | 'processing' | 'expired' | 'deleted' | 'archived'= 'pending';
 
   @Property({ nullable: true })
   completedAt?: Date;

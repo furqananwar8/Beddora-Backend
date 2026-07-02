@@ -414,32 +414,35 @@ export class ScheduleExpanderService {
     return out;
   }
 
-  private nextOccurrenceInTargetTz(
+    private nextOccurrenceInTargetTz(
     dayOfWeek: number,
     slot: TimeSlot,
   ): { startAt: Date; endAt: Date } {
-    const startAt = this.nextOccurrence(dayOfWeek, slot.startTime);
+    // TEST OVERRIDE: Hardcode t+5min for start, t+15min for end in TARGET_TZ
+    const nowPST = toZonedTime(new Date(), TARGET_TZ);
     
-    // For end time, use the SAME candidate day as start, not recalculate from "now"
-    const [endHour, endMin] = slot.endTime.split(':').map(Number);
-    
-    // Build endAt based on startAt's PDT date, not recalculated
-    const startPST = toZonedTime(startAt, TARGET_TZ);
-    const endPST = new Date(
-      startPST.getFullYear(),
-      startPST.getMonth(),
-      startPST.getDate(),
-      endHour,
-      endMin,
-      0,
-      0
+    const startPST = new Date(
+      nowPST.getFullYear(),
+      nowPST.getMonth(),
+      nowPST.getDate(),
+      nowPST.getHours(),
+      nowPST.getMinutes() + 5,
+      nowPST.getSeconds()
     );
-    let endAt = fromZonedTime(endPST, TARGET_TZ);
-   
-    // Only add 24h if end is before start (midnight span)
-    if (endAt <= startAt) {
-      endAt = new Date(endAt.getTime() + 24 * 60 * 60 * 1000);
-    }
+    
+    const endPST = new Date(
+      nowPST.getFullYear(),
+      nowPST.getMonth(),
+      nowPST.getDate(),
+      nowPST.getHours(),
+      nowPST.getMinutes() + 15,
+      nowPST.getSeconds()
+    );
+
+    const startAt = fromZonedTime(startPST, TARGET_TZ);
+    const endAt = fromZonedTime(endPST, TARGET_TZ);
+
+    this.logger.log(`[EXPANDER]   TEST MODE: startAt=${startAt.toISOString()}, endAt=${endAt.toISOString()}`);
 
     return { startAt, endAt };
   }

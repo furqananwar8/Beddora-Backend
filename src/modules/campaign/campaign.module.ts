@@ -10,13 +10,19 @@ import { ScheduleExpanderService } from './service/schedule-expander.service';
 import { CampaignSchedulerWorker } from './worker/campaign-scheduler.worker';
 import { SessionModule } from 'src/modules/session/session.module';
 import { EmailModule } from '../email/email.module';
+import { RedisModule } from 'src/redis/redis.module';
+import { RedisLifecycleService } from 'src/redis/redis-lifecycle.service';
+import { RedisReconciliationService } from 'src/redis/redis-reconciliation.service';
+import { AlertModule } from '../alert/alert.module';
 
 @Module({
   imports: [
     HttpModule,
     SessionModule,
     EmailModule,
+    AlertModule,
     BullModule.registerQueue({ name: 'campaign-scheduler' }),
+    RedisModule,
   ],
   controllers: [CampaignController, AmazonApiController],
   providers: [
@@ -25,6 +31,8 @@ import { EmailModule } from '../email/email.module';
     AmazonCampaignApiClient,
     ScheduleExpanderService,
     CampaignSchedulerWorker,
+    RedisLifecycleService,
+    RedisReconciliationService,
   ],
   exports: [AmazonCampaignApiClient],
 })
