@@ -14,12 +14,20 @@ import { RedisModule } from 'src/redis/redis.module';
   imports: [
     ConfigModule,
     RedisModule,
-    BullModule.registerQueue({
-      name: AMAZON_TOKEN_REFRESH
+      BullModule.registerQueue({
+      name: AMAZON_TOKEN_REFRESH,
+      defaultJobOptions: {
+        removeOnComplete: { count: 1, age: 7200 },
+        removeOnFail: { count: 5, age: 7200 },
+      },
     }),
     BullModule.registerQueue({
       name: AMAZON_PROFILE_TOKEN_REFRESH,
-    }), 
+      defaultJobOptions: {
+        removeOnComplete: { count: 1, age: 7200 },
+        removeOnFail: { count: 5, age: 7200 },
+      },
+    }),
     HttpModule
   ],
    providers: [
