@@ -26,7 +26,6 @@ export const RedisProvider: Provider = {
           maxRetriesPerRequest: null,
           enableReadyCheck: false,
           lazyConnect: true, // ← changed: don't crash on startup if Redis is down
-          enableOfflineQueue: false,
           connectTimeout: 5000,
           retryStrategy: (times) => {
             if (times > 3) {
@@ -45,7 +44,6 @@ export const RedisProvider: Provider = {
           maxRetriesPerRequest: null,
           enableReadyCheck: false,
           lazyConnect: true,
-          enableOfflineQueue: false,
           connectTimeout: 5000,
           retryStrategy: (times) => {
             if (times > 3) {

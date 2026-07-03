@@ -414,47 +414,15 @@ export class ScheduleExpanderService {
     return out;
   }
 
+
   private nextOccurrenceInTargetTz(
     dayOfWeek: number,
     slot: TimeSlot,
   ): { startAt: Date; endAt: Date } {
-    // ─── TEST OVERRIDE (commented out) ───
-    // TEST OVERRIDE: Hardcode t+5min for start, t+15min for end in TARGET_TZ
-    // const nowPST = toZonedTime(new Date(), TARGET_TZ);
-    //
-    // const startPST = new Date(
-    //   nowPST.getFullYear(),
-    //   nowPST.getMonth(),
-    //   nowPST.getDate(),
-    //   nowPST.getHours(),
-    //   nowPST.getMinutes() + 5,
-    //   nowPST.getSeconds()
-    // );
-    //
-    // const endPST = new Date(
-    //   nowPST.getFullYear(),
-    //   nowPST.getMonth(),
-    //   nowPST.getDate(),
-    //   nowPST.getHours(),
-    //   nowPST.getMinutes() + 15,
-    //   nowPST.getSeconds()
-    // );
-    //
-    // const startAt = fromZonedTime(startPST, TARGET_TZ);
-    // const endAt = fromZonedTime(endPST, TARGET_TZ);
-    //
-    // this.logger.log(`[EXPANDER]   TEST MODE: startAt=${startAt.toISOString()}, endAt=${endAt.toISOString()}`);
-    //
-    // return { startAt, endAt };
-    // ─── END TEST OVERRIDE ───
-
-    // ─── PRODUCTION CODE ───
-    const startAt = this.nextOccurrence(dayOfWeek, slot.startTime);
-
-    // For end time, use the SAME candidate day as start, not recalculate from "now"
+    const startAt = this.nextOccurrence(dayOfWeek, slot.startTime, slot.endTime);
     const [endHour, endMin] = slot.endTime.split(':').map(Number);
 
-    // Build endAt based on startAt's PDT date, not recalculated
+    // Build endAt from the SAME day as startAt
     const startPST = toZonedTime(startAt, TARGET_TZ);
     const endPST = new Date(
       startPST.getFullYear(),
@@ -467,7 +435,7 @@ export class ScheduleExpanderService {
     );
     let endAt = fromZonedTime(endPST, TARGET_TZ);
 
-    // Only add 24h if end is before start (midnight span)
+    // Handle overnight slots (e.g., 22:00 - 02:00)
     if (endAt <= startAt) {
       endAt = new Date(endAt.getTime() + 24 * 60 * 60 * 1000);
     }
@@ -475,17 +443,18 @@ export class ScheduleExpanderService {
     return { startAt, endAt };
   }
 
-  private nextOccurrence(
+    private nextOccurrence(
     dayOfWeek: number,
-    timeStr: string,
+    startTimeStr: string,
+    endTimeStr: string,
     baseDate: Date = new Date()
   ): Date {
-    const [hours, minutes] = timeStr.split(':').map(Number);
+    const [hours, minutes] = startTimeStr.split(':').map(Number);
+    const [endHours, endMinutes] = endTimeStr.split(':').map(Number);
 
-    // Work entirely in wall-clock LA time using date-fns-tz correctly
+    // Work entirely in wall-clock LA time
     const zonedNow = toZonedTime(baseDate, TARGET_TZ);
 
-    // Build candidate as a plain struct in LA time, then convert
     const candidateZoned = new Date(
       zonedNow.getFullYear(),
       zonedNow.getMonth(),
@@ -496,6 +465,21 @@ export class ScheduleExpanderService {
       0
     );
 
+    const endZoned = new Date(
+      zonedNow.getFullYear(),
+      zonedNow.getMonth(),
+      zonedNow.getDate(),
+      endHours,
+      endMinutes,
+      0,
+      0
+    );
+
+    // If slot crosses midnight (e.g., 22:00-02:00), endZoned is on the next calendar day
+    if (endHours < hours || (endHours === hours && endMinutes < minutes)) {
+      endZoned.setDate(endZoned.getDate() + 1);
+    }
+
     this.logger.log(
       `[EXPANDER]   nextOccurrence: zonedNow=${format(zonedNow, 'yyyy-MM-dd HH:mm:ssxxx', { timeZone: TARGET_TZ })}`
     );
@@ -503,14 +487,27 @@ export class ScheduleExpanderService {
     let daysUntil = dayOfWeek - candidateZoned.getDay();
     if (daysUntil < 0) daysUntil += 7;
 
-    if (daysUntil === 0 && fromZonedTime(candidateZoned, TARGET_TZ).getTime() <= baseDate.getTime() + 60000) {
-      daysUntil = 7;
-      this.logger.log(`[EXPANDER]   Slot already passed or too soon, pushing to next week`);
+    const candidateUtc = fromZonedTime(candidateZoned, TARGET_TZ);
+    const endUtc = fromZonedTime(endZoned, TARGET_TZ);
+
+    // Same day and start time has already passed (or is right now)
+    if (daysUntil === 0 && candidateUtc.getTime() <= baseDate.getTime()) {
+      // Strictly-less-than: at the exact end instant, treat as closed
+      if (baseDate.getTime() < endUtc.getTime()) {
+        this.logger.log(
+          `[EXPANDER]   Within active slot (${startTimeStr}-${endTimeStr}), keeping today`
+        );
+        // daysUntil stays 0 — candidateZoned remains at the actual slot start time
+      } else {
+        // Past the end of the slot (or exactly at it) — push to next week
+        daysUntil = 7;
+        this.logger.log(
+          `[EXPANDER]   Slot ended at ${endTimeStr}, pushing to next week`
+        );
+      }
     }
 
     candidateZoned.setDate(candidateZoned.getDate() + daysUntil);
-
-    // NOW convert wall-clock LA time → UTC. date-fns-tz handles DST here.
     const utcResult = fromZonedTime(candidateZoned, TARGET_TZ);
 
     this.logger.log(`[EXPANDER]   Converted to UTC: ${utcResult.toISOString()}`);

@@ -42,7 +42,6 @@ import Redis from 'ioredis';
             enableReadyCheck: false,
             lazyConnect: true,
             // 🔴 ADD THESE:
-            enableOfflineQueue: false,  // Don't queue commands when disconnected
             connectTimeout: 5000,       // 5 second connection timeout
             retryStrategy: (times) => {
               if (times > 3) {
@@ -62,7 +61,6 @@ import Redis from 'ioredis';
             enableReadyCheck: false,
             lazyConnect: true,
             // 🔴 ADD THESE:
-            enableOfflineQueue: false,
             connectTimeout: 5000,
             retryStrategy: (times) => {
               if (times > 3) {

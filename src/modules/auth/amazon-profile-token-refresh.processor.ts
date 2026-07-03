@@ -16,6 +16,7 @@ export class AmazonProfileTokenRefreshProcessor extends WorkerHost {
     @InjectQueue(AMAZON_PROFILE_TOKEN_REFRESH) private readonly tokenRefreshQueue: Queue,
   ) {
     super();
+    this.logger.log(`🔥 WORKER STARTED for queue: ${AMAZON_PROFILE_TOKEN_REFRESH}`);
   }
 
   async process(job: Job<{ profileId: number }>): Promise<void> {
@@ -54,7 +55,7 @@ export class AmazonProfileTokenRefreshProcessor extends WorkerHost {
       await this.tokenRefreshQueue.add(
         'refresh-service',
         { profileId },
-        { delay: REFRESH_JOB_DELAY_MS },
+        { delay: REFRESH_JOB_DELAY_MS, attempts: 3, removeOnFail: { count: 5 }, removeOnComplete: { count: 10 } },
       );
     } catch (err) {
       this.logger.error(`Profile token refresh failed for profile ${profileId}`, err);
