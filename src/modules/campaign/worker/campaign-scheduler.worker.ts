@@ -123,23 +123,23 @@ export class CampaignSchedulerWorker extends WorkerHost implements OnApplication
 
       if (scheduleJob.action === 'ENABLE') {
         this.logger.log(`[WORKER] 🚀 Calling Amazon API: ENABLE campaign ${scheduleJob.campaignId}`);
-        // await this.amazonClient.updateCampaign(
-        //   tokenData.access_token,
-        //   scheduleJob.profileId as number,
-        //   scheduleJob.region as 'na' | 'eu' | 'fe',
-        //   scheduleJob.campaignId as string,
-        //   { state: 'ENABLED' },
-        // );
+        await this.amazonClient.updateCampaign(
+          tokenData.access_token,
+          scheduleJob.profileId as number,
+          scheduleJob.region as 'na' | 'eu' | 'fe',
+          scheduleJob.campaignId as string,
+          { state: 'ENABLED' },
+        );
         this.logger.log(`[WORKER] ✅ SUCCESS: ENABLED campaign ${scheduleJob.campaignId}`);
       } else if (scheduleJob.action === 'PAUSE') {
         this.logger.log(`[WORKER] 🚀 Calling Amazon API: PAUSE campaign ${scheduleJob.campaignId}`);
-        // await this.amazonClient.updateCampaign(
-        //   tokenData.access_token,
-        //   scheduleJob.profileId as number,
-        //   scheduleJob.region as 'na' | 'eu' | 'fe',
-        //   scheduleJob.campaignId as string,
-        //   { state: 'PAUSED' },
-        // );
+        await this.amazonClient.updateCampaign(
+          tokenData.access_token,
+          scheduleJob.profileId as number,
+          scheduleJob.region as 'na' | 'eu' | 'fe',
+          scheduleJob.campaignId as string,
+          { state: 'PAUSED' },
+        );
         this.logger.log(`[WORKER] ✅ SUCCESS: PAUSED campaign ${scheduleJob.campaignId}`);
       } else {
         this.logger.log(`[WORKER] ⚠️ WARNING: Unknown action '${scheduleJob.action}'`);

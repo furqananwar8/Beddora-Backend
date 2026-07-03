@@ -44,6 +44,15 @@ import Redis from 'ioredis';
             // 🔴 ADD THESE:
             enableOfflineQueue: false,  // Don't queue commands when disconnected
             connectTimeout: 5000,       // 5 second connection timeout
+            retryStrategy: (times) => {
+              if (times > 3) {
+                console.log('[REDIS] Max retries (3) reached, stopping reconnection attempts');
+                return null; // null = stop retrying
+              }
+              const delay = Math.min(times * 1000, 3000); // 1s, 2s, 3s
+              console.log(`[REDIS] Reconnect attempt ${times}/3 in ${delay}ms`);
+              return delay;
+            }
           });
         } else {
           connection = new Redis({
@@ -55,6 +64,15 @@ import Redis from 'ioredis';
             // 🔴 ADD THESE:
             enableOfflineQueue: false,
             connectTimeout: 5000,
+            retryStrategy: (times) => {
+              if (times > 3) {
+                console.log('[REDIS] Max retries (3) reached, stopping reconnection attempts');
+                return null; // null = stop retrying
+              }
+              const delay = Math.min(times * 1000, 3000); // 1s, 2s, 3s
+              console.log(`[REDIS] Reconnect attempt ${times}/3 in ${delay}ms`);
+              return delay;
+            },
           });
         }
 

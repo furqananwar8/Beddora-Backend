@@ -28,6 +28,15 @@ export const RedisProvider: Provider = {
           lazyConnect: true, // ← changed: don't crash on startup if Redis is down
           enableOfflineQueue: false,
           connectTimeout: 5000,
+          retryStrategy: (times) => {
+            if (times > 3) {
+              console.log('[REDIS] Max retries (3) reached, stopping reconnection attempts');
+              return null; // null = stop retrying
+            }
+            const delay = Math.min(times * 1000, 3000); // 1s, 2s, 3s
+            console.log(`[REDIS] Reconnect attempt ${times}/3 in ${delay}ms`);
+            return delay;
+          },
         })
       : new Redis({
           host: config.get('REDIS_HOST', 'localhost'),
@@ -38,6 +47,15 @@ export const RedisProvider: Provider = {
           lazyConnect: true,
           enableOfflineQueue: false,
           connectTimeout: 5000,
+          retryStrategy: (times) => {
+            if (times > 3) {
+              console.log('[REDIS] Max retries (3) reached, stopping reconnection attempts');
+              return null; // null = stop retrying
+            }
+            const delay = Math.min(times * 1000, 3000); // 1s, 2s, 3s
+            console.log(`[REDIS] Reconnect attempt ${times}/3 in ${delay}ms`);
+            return delay;
+          },
         });
 
     // 🔴 THIS IS THE FIX
