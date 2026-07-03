@@ -24,17 +24,26 @@ export const RedisProvider: Provider = {
           name: config.get('REDIS_SENTINEL_MASTER_NAME', 'mymaster'),
           password: config.get('REDIS_PASSWORD'),
           maxRetriesPerRequest: null,
-          enableReadyCheck: true,
-          lazyConnect: false,
+          enableReadyCheck: false,
+          lazyConnect: true, // ← changed: don't crash on startup if Redis is down
+          enableOfflineQueue: false,
+          connectTimeout: 5000,
         })
       : new Redis({
           host: config.get('REDIS_HOST', 'localhost'),
           port: config.get<number>('REDIS_PORT', 6379),
           password: config.get('REDIS_PASSWORD'),
           maxRetriesPerRequest: null,
-          enableReadyCheck: true,
-          lazyConnect: false,
+          enableReadyCheck: false,
+          lazyConnect: true,
+          enableOfflineQueue: false,
+          connectTimeout: 5000,
         });
+
+    // 🔴 THIS IS THE FIX
+    client.on('error', (err) => {
+      console.error('[REDIS-CLIENT] Connection error (non-fatal):', err.message);
+    });
 
     return client;
   },

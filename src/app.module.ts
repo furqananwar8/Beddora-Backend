@@ -15,6 +15,7 @@ import { EmailModule } from './modules/email/email.module';
 import { UserModule } from './modules/user/user.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { HealthModule } from './modules/health/health.module';
+import Redis from 'ioredis';
 
 @Module({
   imports: [
@@ -28,34 +29,40 @@ import { HealthModule } from './modules/health/health.module';
       useFactory: (config: ConfigService) => {
         const isSentinel = config.get('REDIS_SENTINEL_ENABLED') === 'true';
 
-        if (isSentinel) {
-          return {
-            connection: {
-              sentinels: [
-                {
-                  host: config.get('REDIS_SENTINEL_HOST_1'),
-                  port: config.get<number>('REDIS_SENTINEL_PORT_1', 26479),
-                },
-                {
-                  host: config.get('REDIS_SENTINEL_HOST_2'),
-                  port: config.get<number>('REDIS_SENTINEL_PORT_2', 26480),
-                },
-              ],
-              name: config.get('REDIS_SENTINEL_MASTER_NAME', 'mymaster'),
-              maxRetriesPerRequest: null,
-              enableReadyCheck: false,
-            },
-          };
-        }
+        let connection: Redis;
 
-        return {
-          connection: {
+        if (isSentinel) {
+          connection = new Redis({
+            sentinels: [
+              { host: config.get('REDIS_SENTINEL_HOST_1'), port: config.get<number>('REDIS_SENTINEL_PORT_1', 26479) },
+              { host: config.get('REDIS_SENTINEL_HOST_2'), port: config.get<number>('REDIS_SENTINEL_PORT_2', 26480) },
+            ],
+            name: config.get('REDIS_SENTINEL_MASTER_NAME', 'mymaster'),
+            maxRetriesPerRequest: null,
+            enableReadyCheck: false,
+            lazyConnect: true,
+            // 🔴 ADD THESE:
+            enableOfflineQueue: false,  // Don't queue commands when disconnected
+            connectTimeout: 5000,       // 5 second connection timeout
+          });
+        } else {
+          connection = new Redis({
             host: config.get('REDIS_HOST', 'localhost'),
             port: config.get<number>('REDIS_PORT', 6379),
             maxRetriesPerRequest: null,
             enableReadyCheck: false,
-          },
-        };
+            lazyConnect: true,
+            // 🔴 ADD THESE:
+            enableOfflineQueue: false,
+            connectTimeout: 5000,
+          });
+        }
+
+        connection.on('error', (err) => {
+          console.error('[BULLMQ-REDIS] Connection error (non-fatal):', err.message);
+        });
+
+        return { connection };
       },
       inject: [ConfigService],
     }),

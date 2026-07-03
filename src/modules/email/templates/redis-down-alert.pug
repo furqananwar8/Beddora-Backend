@@ -10,33 +10,35 @@ block content
   br
   br
 
-  if hasInProgressCampaigns
-    strong 🚨 Campaigns currently running and at risk:
+  if jobCount > 0
+    strong 🚨 #{jobCount} campaign(s) at risk:
     br
     br
 
     table(border="1", cellpadding="8", cellspacing="0", style="border-collapse: collapse; width: 100%; font-size: 14px;")
       thead
         tr(style="background: #fff2f2;")
+          th(style="text-align: left;") Job ID
           th(style="text-align: left;") Campaign
           th(style="text-align: left;") Campaign ID
-          th(style="text-align: left;") Enabled At
-          th(style="text-align: left;") Pause Scheduled
+          th(style="text-align: left;") Action
+          th(style="text-align: left;") Scheduled At
           th(style="text-align: left;") Status
       tbody
-        each campaign in campaigns
+        each job in jobs
           tr
-            td= campaign.campaignName
-            td= campaign.campaignId
-            td= campaign.enabledAt
-            td= campaign.pauseScheduledAt
-            td(style="color: " + (campaign.timeRemaining.includes('OVERDUE') ? '#d32f2f' : '#333'))= campaign.timeRemaining
+            td= job.id
+            td= job.campaignName
+            td= job.campaignId
+            td= job.action
+            td= job.scheduledAt
+            td(style="color: " + (job.status.includes('OVERDUE') ? '#d32f2f' : '#333'))= job.status
 
     br
     br
     strong Action required:
     br
-    | These campaigns are currently ENABLED and spending budget. 
+    | These campaigns have pending pause jobs that may not execute.
     br
     | If Redis does not recover before the scheduled pause time, 
     strong you must manually pause them in Amazon Ads Console.
@@ -49,7 +51,3 @@ block content
     | No campaigns are currently in an active slot. All pending jobs are scheduled starts.
 
   br
-  br
-  | Please check the Redis cluster and BullMQ dashboard immediately.
-  br
-  | Timestamp: #{downSince}

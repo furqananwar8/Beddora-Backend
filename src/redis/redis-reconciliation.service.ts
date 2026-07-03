@@ -16,6 +16,7 @@ export class RedisReconciliationService {
   ) {}
 
   async reconcileOnConnect(): Promise<void> {
+    const em = this.em.fork();
     this.logger.log('[RECONCILE] Starting post-outage cleanup...');
 
     // STEP 1: Find jobs that were in the alert email AND missed their window
@@ -35,7 +36,7 @@ export class RedisReconciliationService {
 
         job.status = 'cancelled';
         job.errorMessage = 'Cancelled: Redis outage, admin notified, job missed window';
-        await this.em.flush();
+        await em.flush();  // ← FIX: was this.em.flush()
       } catch (err: any) {
         this.logger.error(`[RECONCILE] Failed to clean up job ${job.id}: ${err.message}`);
       }
@@ -52,7 +53,6 @@ export class RedisReconciliationService {
 
     this.logger.log('[RECONCILE] Cleanup complete.');
   }
-
   private async cleanupZombies(): Promise<void> {
     const [delayed, waiting] = await Promise.all([
       this.queue.getJobs('delayed'),

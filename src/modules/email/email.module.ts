@@ -11,5 +11,4 @@ import { EventEmitterModule } from "@nestjs/event-emitter";
     providers: [EmailService, EmailListener, MailWarmUpService],
     exports: [EmailService]
 })
-
 export class EmailModule {}

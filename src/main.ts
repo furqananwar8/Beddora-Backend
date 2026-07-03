@@ -47,6 +47,14 @@ async function bootstrap() {
   const document = SwaggerModule.createDocument(app, config);
   SwaggerModule.setup('api/docs', app, document); // → http://localhost:3000/api/docs
 
+  process.on('uncaughtException', (err) => {
+    console.error('[PROCESS] Uncaught exception (non-fatal):', err.message);
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    console.error('[PROCESS] Unhandled rejection (non-fatal):', reason);
+  });
+  
   await app.listen(process.env.PORT ?? 3000);
 }
 bootstrap();

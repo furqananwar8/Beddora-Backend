@@ -3,7 +3,7 @@ import { Job, Queue } from 'bullmq';
 import { EntityManager } from '@mikro-orm/core';
 import { InjectQueue } from '@nestjs/bullmq';
 import { ConfigService } from '@nestjs/config';
-import { Logger } from '@nestjs/common';
+import { Logger, OnApplicationBootstrap } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { toZonedTime, fromZonedTime } from 'date-fns-tz';
 
@@ -14,11 +14,14 @@ import { ProfileTokenService } from 'src/modules/session/service/profile-token.s
 import { EmailService } from 'src/modules/email/service/email.service';
 import { ScheduleExpanderService } from '../service/schedule-expander.service';
 import { TARGET_TZ } from 'src/common/constants/bullmq.constant';
+import { JobAlertService } from 'src/modules/alert/service/alert.service';
 
 @Processor('campaign-scheduler', { concurrency: 1 })
-export class CampaignSchedulerWorker extends WorkerHost {
+export class CampaignSchedulerWorker extends WorkerHost implements OnApplicationBootstrap {
   private logger = new Logger(CampaignSchedulerWorker.name);
-  private readonly TERMINAL_STATUSES = ['pending','completed','failed','cancelled','processing','expired'];
+  private readonly TERMINAL_STATUSES = ['completed', 'failed', 'cancelled', 'expired'];
+  private redisAlertSent = false;
+  private lastAlertTime: number | null = null;
 
   constructor(
     private readonly em: EntityManager,
@@ -27,10 +30,16 @@ export class CampaignSchedulerWorker extends WorkerHost {
     private readonly emailService: EmailService,
     private readonly configService: ConfigService,
     private readonly expander: ScheduleExpanderService,
+    private readonly jobAlertService: JobAlertService,
     @InjectQueue('campaign-scheduler') private readonly schedulerQueue: Queue,
   ) {
     super();
     console.log('[WORKER] ✅ CampaignSchedulerWorker INSTANTIATED');
+  }
+
+  async onApplicationBootstrap() {
+    this.logger.log('[WORKER] Running initial orphan check on bootstrap...');
+    await this.enqueueOrphanedJobs();
   }
 
   async process(job: Job<{ jobId: number }>): Promise<void> {
@@ -60,7 +69,6 @@ export class CampaignSchedulerWorker extends WorkerHost {
 
     if (scheduleJob.status !== 'pending') {
       this.logger.log(`[WORKER] ⏭️ SKIPPED: status is '${scheduleJob.status}', expected 'pending'`);
-      this.logger.warn(`[WORKER] 🧟 ZOMBIE JOB ${job.data.jobId}: not found in DB. Removing from queue.`);
       return;
     }
 
@@ -99,28 +107,6 @@ export class CampaignSchedulerWorker extends WorkerHost {
       this.logger.log(`[WORKER] ⏭️ SKIPPED: parent schedule isActive=false (deferred cancellation)`);
       scheduleJob.status = 'cancelled';
       await em.flush();
-      return;
-    }
-
-    if ((scheduleJob.status as string) === 'failed') {
-      const failureAge = Date.now() - (scheduleJob.updatedAt?.getTime() ?? 0);
-      const MAX_RETRY_AGE_MS = 24 * 60 * 60 * 1000;
-
-      if (failureAge > MAX_RETRY_AGE_MS) {
-        this.logger.warn(`[WORKER] ⏹️ Job ${job.data.jobId} failed ${Math.round(failureAge / 3600000)}h ago, not retrying`);
-        scheduleJob.status = 'expired';
-        await em.flush();
-        return;
-      }
-
-      this.logger.log(`[WORKER] 🔄 RETRY detected for job ${job.data.jobId}, resetting status to pending`);
-      scheduleJob.status = 'pending';
-      scheduleJob.errorMessage = null;
-      await em.flush();
-    }
-
-    if (scheduleJob.status !== 'pending') {
-      this.logger.log(`[WORKER] ⏭️ SKIPPED: status is '${scheduleJob.status}', expected 'pending'`);
       return;
     }
 
@@ -230,11 +216,12 @@ export class CampaignSchedulerWorker extends WorkerHost {
     this.logger.log(`[WORKER-EVENT] ✅ Job ${job.data.jobId} marked as permanently failed`);
   }
 
-  @Cron(CronExpression.EVERY_30_SECONDS)
+  @Cron('0 */55 * * * *')  // Every 55 minutes
   async enqueueOrphanedJobs(): Promise<void> {
     const em = this.em.fork();
     const now = Date.now();
     const oneWeekFromNow = new Date(now + 7 * 24 * 60 * 60 * 1000);
+    const oneHourFromNow = new Date(now + 60 * 60 * 1000);
 
     const orphaned = await em.find(
       ScheduleJob,
@@ -246,22 +233,45 @@ export class CampaignSchedulerWorker extends WorkerHost {
       { limit: 50 },
     );
 
-    if (orphaned.length === 0) return;
+    if (orphaned.length === 0) {
+      this.redisAlertSent = false;
+      return;
+    }
 
-    this.logger.log(`[OUTBOX] Found ${orphaned.length} orphaned jobs to enqueue`);
+    // Only care about jobs at risk within the next hour
+    const atRiskOrphans = orphaned.filter(job => {
+      if (!job.executeAt) return false;
+      return job.executeAt.getTime() <= oneHourFromNow.getTime();
+    });
 
-    for (const job of orphaned) {
-      const delay = (job.executeAt as any).getTime() - now;
+    if (atRiskOrphans.length === 0) {
+      this.logger.log(`[OUTBOX] Found ${orphaned.length} orphans but none at risk within 60min`);
+      return;
+    }
+
+    this.logger.log(`[OUTBOX] Found ${atRiskOrphans.length} at-risk orphans (out of ${orphaned.length} total)`);
+
+    let redisDownDetected = false;
+
+    for (const job of atRiskOrphans) {
+      const delay = job.executeAt!.getTime() - now;
       const bullJobId = `schedule-${job.id}`;
 
+      this.logger.log(`[OUTBOX] Checking job ${job.id}, bullJobId=${bullJobId}`);
+
       try {
+        this.logger.log(`[OUTBOX] Calling getJob for ${bullJobId}...`);
         const existing = await this.schedulerQueue.getJob(bullJobId);
+        this.logger.log(`[OUTBOX] getJob result for ${bullJobId}: ${existing ? 'FOUND' : 'NOT FOUND'}`);
+        
         if (existing) {
           job.bullJobId = bullJobId;
           await em.flush();
+          this.logger.log(`[OUTBOX] Job ${job.id} already enqueued, updated bullJobId`);
           continue;
         }
 
+        this.logger.log(`[OUTBOX] Calling add for ${bullJobId}...`);
         await this.schedulerQueue.add('execute', { jobId: job.id }, {
           delay: Math.max(0, delay),
           jobId: bullJobId,
@@ -277,7 +287,27 @@ export class CampaignSchedulerWorker extends WorkerHost {
 
       } catch (err: any) {
         this.logger.error(`[OUTBOX] ❌ Redis still down? Failed to enqueue ${job.id}: ${err.message}`);
+        redisDownDetected = true;
         break;
+      }
+    }
+
+    if (redisDownDetected) {
+      const shouldSend = !this.lastAlertTime 
+        || (now - this.lastAlertTime) > (55 * 60 * 1000);
+
+      if (!shouldSend) {
+        const minsAgo = Math.round((now - this.lastAlertTime!) / 60000);
+        this.logger.log(`[OUTBOX] ⏭️ Alert sent ${minsAgo}min ago, skipping`);
+        return;
+      }
+
+      try {
+        await this.jobAlertService.sendRedisDownAlert();
+        this.lastAlertTime = now;
+        this.logger.log(`[OUTBOX] 🚨 Redis down alert sent for ${atRiskOrphans.length} at-risk jobs`);
+      } catch (alertErr: any) {
+        this.logger.error(`[OUTBOX] ❌ Failed to send Redis down alert: ${alertErr.message}`);
       }
     }
   }
@@ -406,36 +436,9 @@ export class CampaignSchedulerWorker extends WorkerHost {
       removeOnComplete: { count: 10 },
     });
 
+    newJob.bullJobId = bullJobId;
+    await em.flush();
+
     this.logger.log(`[WORKER] ✅ Re-queued next week job ${bullJobId}`);
-    this.logger.log(`[WORKER] Enqueueing with delay: ${Math.round(delay / 1000)}s`);
-
-    try {
-      const existingBullJob = await this.schedulerQueue.getJob(bullJobId);
-      if (existingBullJob) {
-        this.logger.log(`[WORKER] ⚠️ BullMQ job ${bullJobId} already exists, removing first`);
-        await this.schedulerQueue.remove(bullJobId);
-      }
-
-      await this.schedulerQueue.add('execute', { jobId: newJob.id }, {
-        delay: Math.max(0, delay),
-        jobId: bullJobId,
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 60000 },
-        removeOnFail: { count: 5 },
-        removeOnComplete: { count: 10 },
-      });
-
-      newJob.bullJobId = bullJobId;
-      await em.flush();
-
-      this.logger.log(`[WORKER] ✅ Re-queued next week job ${bullJobId}`);
-
-    } catch (redisErr: any) {
-      this.logger.error(
-        `[WORKER] ❌ Redis enqueue failed for next-week job ${newJob.id}: ${redisErr.message}. ` +
-        `Outbox cron will retry when Redis is back.`
-      );
-      // Job remains in DB with bullJobId=null; enqueueOrphanedJobs will pick it up
-    }
   }
 }

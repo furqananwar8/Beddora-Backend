@@ -51,7 +51,7 @@ export class JobAlertService {
     await em.flush();
 
     try {
-      await (this.emailService as any).sendMail?.({
+      await (this.emailService as any).sendFailedJobEmail?.({
         to: adminEmails,
         subject: `🚨 Redis Down — ${atRiskJobs.length} Pause Jobs At Risk`,
         template: 'redis-down-alert',
@@ -115,8 +115,9 @@ export class JobAlertService {
    * executeAt <= now → should have run already but didn't
    */
   async getMissedAlertedJobs(): Promise<ScheduleJob[]> {
+    const em = this.em.fork();  // ← ADD THIS
     const now = this.getUtcNow();
-    return this.em.find(ScheduleJob, {
+    return em.find(ScheduleJob, {  // ← Use forked EM
       redisAlertSentAt: { $ne: null },
       status: 'pending',
       executeAt: { $lte: now },
@@ -127,9 +128,11 @@ export class JobAlertService {
    * Jobs that were in the alert email but are still pending and in the future.
    * executeAt > now → can still run normally
    */
+
   async getSurvivingAlertedJobs(): Promise<ScheduleJob[]> {
+    const em = this.em.fork();  // ← ADD THIS
     const now = this.getUtcNow();
-    return this.em.find(ScheduleJob, {
+    return em.find(ScheduleJob, {  // ← Use forked EM
       redisAlertSentAt: { $ne: null },
       status: 'pending',
       executeAt: { $gt: now },
