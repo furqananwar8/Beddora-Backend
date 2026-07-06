@@ -337,7 +337,6 @@ async listCampaigns(
     const em = this.em.fork();
     const now = new Date();
 
-    // ── 1. Single OR query: future jobs OR failed jobs ──
     const where: any = {
       $or: [
         { executeAt: { $gt: now } },
@@ -346,7 +345,7 @@ async listCampaigns(
     };
 
     if (campaignId) {
-      where.campaignId = campaignId; // AND outside the $or
+      where.campaignId = campaignId;
     }
 
     const jobsToDelete = await em.find(ScheduleJob, where, {
@@ -362,21 +361,33 @@ async listCampaigns(
         schedulesToCheck.add(job.schedule);
       }
 
-      // Remove from BullMQ if pending
-      if (job.status === 'pending') {
-        try {
-          await this.schedulerQueue.remove(`schedule-${job.id}`);
-          this.logger.log(`[DELETE] Removed BullMQ job schedule-${job.id}`);
-        } catch (err) {
-          this.logger.warn(`[DELETE] BullMQ job schedule-${job.id} not found or already removed`);
+      // ── FIX: Always check BullMQ, not just pending ──
+      try {
+        const bullJob = await this.schedulerQueue.getJob(`schedule-${job.id}`);
+        if (bullJob) {
+          const state = await bullJob.getState();
+
+          if (state === 'active') {
+            this.logger.warn(
+              `[DELETE] Job schedule-${job.id} is ACTIVE — skipping removal, ` +
+              `will fail naturally on missing DB record`
+            );
+          } else {
+            await bullJob.remove();
+            this.logger.log(`[DELETE] Removed BullMQ job schedule-${job.id} (state: ${state})`);
+          }
+        } else {
+          this.logger.log(`[DELETE] BullMQ job schedule-${job.id} already removed`);
         }
+      } catch (err: any) {
+        this.logger.error(`[DELETE] Error with BullMQ job schedule-${job.id}: ${err.message}`);
       }
 
       em.remove(job);
       deletedCount++;
     }
 
-    // ── 2. Schedule cleanup ──
+    // Schedule cleanup (unchanged)
     for (const schedule of schedulesToCheck) {
       await em.populate(schedule, ['jobs']);
 
@@ -407,6 +418,7 @@ async listCampaigns(
       deletedCount,
     };
   }
+
   // Add temporarily to your AuthController or a test controller
   // @Post('test/fail-job')
   // @ApiOperation({ summary: 'Test job failure email (dev only)' })

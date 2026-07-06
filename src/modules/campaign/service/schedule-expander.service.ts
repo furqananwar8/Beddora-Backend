@@ -39,7 +39,7 @@ export class ScheduleExpanderService {
     campaignId: string,
   ): Promise<{ schedulesRemoved: number; jobsCancelled: number }> {
     const em = this.em.fork();
-    
+
     const allSchedules = await em.find(CampaignSchedule, { campaignId }, {
       populate: ['jobs'],
     });
@@ -53,15 +53,28 @@ export class ScheduleExpanderService {
 
     for (const schedule of allSchedules) {
       for (const job of schedule.jobs) {
-        if (job.status === 'pending') {
-          try {
-            await this.schedulerQueue.remove(`schedule-${job.id}`);
-            this.logger.log(`[CLEAR] Removed BullMQ job schedule-${job.id}`);
-          } catch (err: any) {
-            this.logger.error(`[CLEAR] Failed to remove BullMQ job schedule-${job.id}: ${err.message}`);
+        try {
+          const bullJob = await this.schedulerQueue.getJob(`schedule-${job.id}`);
+          if (bullJob) {
+            const state = await bullJob.getState();
+            
+            if (state === 'active') {
+              this.logger.warn(
+                `[CLEAR] Job schedule-${job.id} is ACTIVE — skipping BullMQ removal, ` +
+                `worker will fail naturally when DB record is missing`
+              );
+            } else {
+              await bullJob.remove();
+              this.logger.log(`[CLEAR] Removed BullMQ job schedule-${job.id} (state: ${state})`);
+            }
+          } else {
+            this.logger.log(`[CLEAR] BullMQ job schedule-${job.id} already gone`);
           }
-          jobsCancelled++;
+        } catch (err: any) {
+          this.logger.error(`[CLEAR] Error with BullMQ job schedule-${job.id}: ${err.message}`);
         }
+        
+        jobsCancelled++;
         em.remove(job);
       }
       em.remove(schedule);
@@ -325,14 +338,28 @@ export class ScheduleExpanderService {
       this.logger.log(`[EXPANDER] Cancelling schedule ${schedule.id}: ${jobs.length} total jobs`);
 
       for (const job of jobs) {
-        if (job.status === 'pending' || job.status === 'cancelled') {
-          try {
-            await this.schedulerQueue.remove(`schedule-${job.id}`);
-            this.logger.log(`[EXPANDER]   Removed queue job schedule-${job.id}`);
-          } catch {
-            /* noop */
+        // ── FIX: Always attempt BullMQ cleanup, not just pending/cancelled ──
+        try {
+          const bullJob = await this.schedulerQueue.getJob(`schedule-${job.id}`);
+          if (bullJob) {
+            const state = await bullJob.getState();
+            
+            if (state === 'active') {
+              this.logger.warn(
+                `[EXPANDER] Job schedule-${job.id} is ACTIVE — skipping removal, ` +
+                `will fail naturally on missing DB record`
+              );
+            } else {
+              await bullJob.remove();
+              this.logger.log(`[EXPANDER] Removed queue job schedule-${job.id} (state: ${state})`);
+            }
+          } else {
+            this.logger.log(`[EXPANDER] Queue job schedule-${job.id} already gone`);
           }
+        } catch (err: any) {
+          this.logger.error(`[EXPANDER] Error removing queue job schedule-${job.id}: ${err.message}`);
         }
+
         em.remove(job);
         count++;
       }
