@@ -55,7 +55,13 @@ export class AmazonProfileTokenRefreshProcessor extends WorkerHost {
       await this.tokenRefreshQueue.add(
         'refresh-service',
         { profileId },
-        { delay: REFRESH_JOB_DELAY_MS, attempts: 3, removeOnFail: { count: 5 }, removeOnComplete: { count: 10 } },
+        {
+          jobId: `refresh-${profileId}`,
+          delay: REFRESH_JOB_DELAY_MS,
+          attempts: 3,
+          removeOnFail: { count: 5 },
+          removeOnComplete: { count: 10 },
+        },
       );
     } catch (err) {
       this.logger.error(`Profile token refresh failed for profile ${profileId}`, err);

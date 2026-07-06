@@ -230,12 +230,17 @@ export class AuthController {
     });
 
     // Profile token refresh chain (survives logout)
-    await this.profileTokenRefreshQueue.add('refresh-service', { profileId: mappedProfiles[0].profileId }, {
-      delay: REFRESH_JOB_DELAY_MS,
-      attempts: 3,
-      removeOnFail: { count: 5 },
-      removeOnComplete: { count: 10 },
-    });
+    await this.profileTokenRefreshQueue.add(
+      'refresh-service',
+      { profileId: mappedProfiles[0].profileId },
+      {
+        jobId: `refresh-${mappedProfiles[0].profileId}`,
+        delay: REFRESH_JOB_DELAY_MS,
+        attempts: 3,
+        removeOnFail: { count: 5 },
+        removeOnComplete: { count: 10 },
+      },
+    );
 
     return res.json({
       success: true,
