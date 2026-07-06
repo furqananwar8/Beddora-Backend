@@ -234,7 +234,6 @@ export class AuthController {
       'refresh-service',
       { profileId: mappedProfiles[0].profileId },
       {
-        jobId: `refresh-${mappedProfiles[0].profileId}`,
         delay: REFRESH_JOB_DELAY_MS,
         attempts: 3,
         removeOnFail: { count: 5 },

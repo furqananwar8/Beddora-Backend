@@ -56,7 +56,6 @@ export class AmazonProfileTokenRefreshProcessor extends WorkerHost {
         'refresh-service',
         { profileId },
         {
-          jobId: `refresh-${profileId}`,
           delay: REFRESH_JOB_DELAY_MS,
           attempts: 3,
           removeOnFail: { count: 5 },
