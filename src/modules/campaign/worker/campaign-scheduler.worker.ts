@@ -5,10 +5,9 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { ConfigService } from '@nestjs/config';
 import { Logger, OnApplicationBootstrap } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { toZonedTime, fromZonedTime } from 'date-fns-tz';
+import { formatInTimeZone } from 'date-fns-tz';
 
 import { ScheduleJob } from 'src/entities/schedule-job.entity';
-import { CampaignSchedule } from 'src/entities/campaign-schedule.entity';
 import { AmazonCampaignApiClient } from '../../amazon/client/amazon-api.client';
 import { ProfileTokenService } from 'src/modules/session/service/profile-token.service';
 import { EmailService } from 'src/modules/email/service/email.service';
@@ -65,6 +64,13 @@ export class CampaignSchedulerWorker extends WorkerHost implements OnApplication
       scheduleJob.status = 'pending';
       scheduleJob.errorMessage = null;
       await em.flush();
+    } else if (scheduleJob.status === 'processing') {
+      // Re-delivered after the process died / the lock was lost mid-run.
+      // Used to be skipped silently, which ended the weekly chain. ENABLE/PAUSE
+      // are idempotent, so resuming is safe.
+      this.logger.warn(`[WORKER] ♻️ Job ${job.data.jobId} was interrupted while 'processing' — resuming`);
+      scheduleJob.status = 'pending';
+      await em.flush();
     }
 
     if (scheduleJob.status !== 'pending') {
@@ -103,9 +109,41 @@ export class CampaignSchedulerWorker extends WorkerHost implements OnApplication
       throw new Error('Schedule relation not loaded');
     }
 
+    // A deferred schedule was removed by the user while its slot was running.
+    // Deferral exists so that slot can close properly: its slot_end must still
+    // run (e.g. PAUSE), otherwise the campaign is left ENABLED indefinitely.
+    // Anything else for it is cancelled, and no next-week job is created.
     if (schedule.isActive === false) {
-      this.logger.log(`[WORKER] ⏭️ SKIPPED: parent schedule isActive=false (deferred cancellation)`);
-      scheduleJob.status = 'cancelled';
+      if (scheduleJob.jobType !== 'slot_end') {
+        this.logger.log(`[WORKER] ⏭️ SKIPPED: parent schedule isActive=false (deferred cancellation)`);
+        scheduleJob.status = 'cancelled';
+        await em.flush();
+        return;
+      }
+      this.logger.log(`[WORKER] 🏁 Deferred schedule ${schedule.id}: running final ${scheduleJob.action} to close the slot`);
+    }
+
+    // Create next week's occurrence BEFORE executing, so the weekly chain
+    // survives this run failing. Idempotent across retries (unique
+    // schedule/jobType/executeAt). If this throws, the reconciler repairs it.
+    if (schedule.isActive !== false && schedule.dayOfWeek !== undefined && schedule.dayOfWeek !== null) {
+      try {
+        const next = await this.expander.ensureNextWeek(schedule, scheduleJob);
+        this.logger.log(`[WORKER] 🔗 Next week job ensured: ${next ? `id=${next.id} at ${next.executeAt?.toISOString()}` : 'n/a (no slot)'}`);
+      } catch (err: any) {
+        this.logger.error(`[WORKER] ⚠️ Could not ensure next week job for ${scheduleJob.id}: ${err.message} (reconciler will retry)`);
+      }
+    }
+
+    // After an outage, overdue delayed jobs are delivered all at once. Only
+    // today's (PT) work is caught up; a job from an earlier day is stale — its
+    // action would put the campaign in the wrong state now — so skip it.
+    if (scheduleJob.executeAt && this.isStaleFromEarlierDay(scheduleJob.executeAt, now)) {
+      this.logger.warn(
+        `[WORKER] ⏭️ Job ${scheduleJob.id} was due ${scheduleJob.executeAt.toISOString()} (an earlier PT day) — marking expired, not executing`,
+      );
+      scheduleJob.status = 'expired';
+      scheduleJob.errorMessage = 'Missed execution window (earlier day); not re-run';
       await em.flush();
       return;
     }
@@ -114,10 +152,12 @@ export class CampaignSchedulerWorker extends WorkerHost implements OnApplication
     await em.flush();
 
     try {
-      const tokenData = await this.profileTokenService.get(scheduleJob.profileId as number);
+      // Refreshes on demand (Redis refresh token, Postgres fallback) instead of
+      // failing whenever the Redis access token has expired.
+      const tokenData = await this.profileTokenService.getValidToken(scheduleJob.profileId as number);
       if (!tokenData?.access_token) {
         this.logger.log(`[WORKER] ❌ ERROR: No valid Amazon token for profile ${scheduleJob.profileId}`);
-        throw new Error('No valid Amazon token');
+        throw new Error('No valid Amazon token (no refresh token available — reconnect Amazon)');
       }
       this.logger.log(`[WORKER] ✅ Profile token acquired for profile ${scheduleJob.profileId}`);
 
@@ -156,17 +196,12 @@ export class CampaignSchedulerWorker extends WorkerHost implements OnApplication
         return;
       }
 
-      if (schedule.isActive && schedule.dayOfWeek !== undefined) {
-        this.logger.log(`[WORKER] 🔄 Re-queueing next week job for schedule ${schedule.id}`);
-        await this.scheduleNextWeek(em, schedule, scheduleJob);
-      } else {
-        this.logger.log(`[WORKER] ⏭️ Skipping re-queue: isActive=${schedule.isActive}, dayOfWeek=${schedule.dayOfWeek}`);
-      }
-
     } catch (err: any) {
       this.logger.log(`[WORKER] ❌ Job ${job.data.jobId} FAILED: ${err.message}`);
       scheduleJob.status = 'failed';
-      scheduleJob.errorMessage = err.message;
+      // error_message is varchar(255); a longer Amazon error used to make this
+      // flush throw and leave the row stuck in 'processing'.
+      scheduleJob.errorMessage = String(err.message ?? err).slice(0, 255);
       await em.flush();
       throw err;
     }
@@ -201,8 +236,10 @@ export class CampaignSchedulerWorker extends WorkerHost implements OnApplication
       return;
     }
 
-    if (this.TERMINAL_STATUSES.includes(scheduleJob.status as any)) {
-      this.logger.log(`[WORKER-EVENT] ⏹️ Job ${job.data.jobId} was cancelled/deleted during retry window. No alert needed.`);
+    // 'failed' is what process() itself writes before rethrowing, so it must
+    // NOT short-circuit here — it did, and admins were never emailed.
+    if (['completed', 'cancelled', 'expired'].includes(scheduleJob.status as any)) {
+      this.logger.log(`[WORKER-EVENT] ⏹️ Job ${job.data.jobId} is '${scheduleJob.status}' (cancelled/finished during retry window). No alert needed.`);
       return;
     }
 
@@ -211,7 +248,7 @@ export class CampaignSchedulerWorker extends WorkerHost implements OnApplication
     await this.notifyAdminOfFailure(scheduleJob, err, currentAttempt);
 
     scheduleJob.status = 'failed';
-    scheduleJob.errorMessage = err.message;
+    scheduleJob.errorMessage = String(err.message ?? err).slice(0, 255);
     await em.flush();
     this.logger.log(`[WORKER-EVENT] ✅ Job ${job.data.jobId} marked as permanently failed`);
   }
@@ -220,71 +257,35 @@ export class CampaignSchedulerWorker extends WorkerHost implements OnApplication
   async enqueueOrphanedJobs(): Promise<void> {
     const em = this.em.fork();
     const now = Date.now();
-    const oneWeekFromNow = new Date(now + 7 * 24 * 60 * 60 * 1000);
-    const oneHourFromNow = new Date(now + 60 * 60 * 1000);
 
-    const orphaned = await em.find(
+    // Every pending job due in the next hour (or just missed) must be in
+    // BullMQ. Previously only rows with bull_job_id NULL were checked, so a
+    // job lost from Redis after it had been enqueued was never recovered.
+    // Anything older than the grace window is handled by SchedulerRecoveryService
+    // (so a days-old ENABLE is never fired blindly).
+    const atRiskOrphans = await em.find(
       ScheduleJob,
       {
         status: 'pending',
-        bullJobId: null,
-        executeAt: { $lte: oneWeekFromNow },
+        executeAt: { $gte: new Date(now - 15 * 60 * 1000), $lte: new Date(now + 60 * 60 * 1000) },
       },
-      { limit: 50 },
+      { orderBy: { executeAt: 'asc', id: 'asc' }, limit: 500 },
     );
 
-    if (orphaned.length === 0) {
+    if (atRiskOrphans.length === 0) {
       this.redisAlertSent = false;
       return;
     }
 
-    // Only care about jobs at risk within the next hour
-    const atRiskOrphans = orphaned.filter(job => {
-      if (!job.executeAt) return false;
-      return job.executeAt.getTime() <= oneHourFromNow.getTime();
-    });
-
-    if (atRiskOrphans.length === 0) {
-      this.logger.log(`[OUTBOX] Found ${orphaned.length} orphans but none at risk within 60min`);
-      return;
-    }
-
-    this.logger.log(`[OUTBOX] Found ${atRiskOrphans.length} at-risk orphans (out of ${orphaned.length} total)`);
+    this.logger.log(`[OUTBOX] Checking ${atRiskOrphans.length} pending jobs due within 60min are enqueued`);
 
     let redisDownDetected = false;
 
     for (const job of atRiskOrphans) {
-      const delay = job.executeAt!.getTime() - now;
-      const bullJobId = `schedule-${job.id}`;
-
-      this.logger.log(`[OUTBOX] Checking job ${job.id}, bullJobId=${bullJobId}`);
-
       try {
-        this.logger.log(`[OUTBOX] Calling getJob for ${bullJobId}...`);
-        const existing = await this.schedulerQueue.getJob(bullJobId);
-        this.logger.log(`[OUTBOX] getJob result for ${bullJobId}: ${existing ? 'FOUND' : 'NOT FOUND'}`);
-        
-        if (existing) {
-          job.bullJobId = bullJobId;
-          await em.flush();
-          this.logger.log(`[OUTBOX] Job ${job.id} already enqueued, updated bullJobId`);
-          continue;
-        }
-
-        this.logger.log(`[OUTBOX] Calling add for ${bullJobId}...`);
-        await this.schedulerQueue.add('execute', { jobId: job.id }, {
-          delay: Math.max(0, delay),
-          jobId: bullJobId,
-          attempts: 3,
-          backoff: { type: 'exponential', delay: 60000 },
-          removeOnFail: { count: 5 },
-          removeOnComplete: { count: 10 },
-        });
-
-        job.bullJobId = bullJobId;
-        await em.flush();
-        this.logger.log(`[OUTBOX] ✅ Enqueued orphaned job ${job.id}`);
-
+        const hadBullId = job.bullJobId;
+        await this.expander.ensureEnqueued(em, job);
+        if (!hadBullId) this.logger.log(`[OUTBOX] ✅ Ensured job ${job.id} is enqueued`);
       } catch (err: any) {
         this.logger.error(`[OUTBOX] ❌ Redis still down? Failed to enqueue ${job.id}: ${err.message}`);
         redisDownDetected = true;
@@ -310,6 +311,13 @@ export class CampaignSchedulerWorker extends WorkerHost implements OnApplication
         this.logger.error(`[OUTBOX] ❌ Failed to send Redis down alert: ${alertErr.message}`);
       }
     }
+  }
+
+  /** True if `executeAt` is on an earlier PT calendar day than `now` and more than 15 min late. */
+  private isStaleFromEarlierDay(executeAt: Date, now: Date): boolean {
+    const lateMs = now.getTime() - executeAt.getTime();
+    if (lateMs <= 15 * 60 * 1000) return false;
+    return formatInTimeZone(executeAt, TARGET_TZ, 'yyyy-MM-dd') < formatInTimeZone(now, TARGET_TZ, 'yyyy-MM-dd');
   }
 
   private async notifyAdminOfFailure(
@@ -361,84 +369,5 @@ export class CampaignSchedulerWorker extends WorkerHost implements OnApplication
     } catch (emailErr: any) {
       this.logger.log(`[WORKER-EVENT] ❌ Failed to send admin email: ${emailErr.message}`);
     }
-  }
-
-  private async scheduleNextWeek(
-    em: EntityManager,
-    schedule: CampaignSchedule,
-    completedJob: ScheduleJob,
-  ): Promise<void> {
-    this.logger.log(`[WORKER] scheduleNextWeek called for completedJob.id=${completedJob.id}`);
-
-    if (!completedJob.executeAt) {
-      this.logger.warn(`[WORKER] ⚠️ Cannot re-queue: completedJob ${completedJob.id} has no executeAt`);
-      return;
-    }
-
-    const timeSlots = schedule.timeSlots ?? [];
-    if (timeSlots.length === 0) {
-      this.logger.log(`[WORKER] ❌ No timeSlots found on schedule ${schedule.id}`);
-      return;
-    }
-
-    const slot = timeSlots[0];
-    const isStartJob = completedJob.jobType === 'slot_start';
-    const targetTimeStr = isStartJob ? slot.startTime : slot.endTime;
-
-    if (!targetTimeStr) {
-      this.logger.log(`[WORKER] ❌ Could not determine target time for jobType=${completedJob.jobType}`);
-      return;
-    }
-
-    const targetAction = completedJob.action;
-
-    const completedPST = toZonedTime(completedJob.executeAt, TARGET_TZ);
-    const nextWeekPST = new Date(completedPST);
-    nextWeekPST.setDate(nextWeekPST.getDate() + 7);
-
-    const [targetHour, targetMin] = targetTimeStr.split(':').map(Number);
-    nextWeekPST.setHours(targetHour, targetMin, 0, 0);
-
-    const executeAt = fromZonedTime(nextWeekPST, TARGET_TZ);
-
-    const newJob = em.create(ScheduleJob, {
-      schedule,
-      campaignId: schedule.campaignId,
-      profileId: schedule.profileId,
-      region: schedule.region,
-      executeAt,
-      jobType: completedJob.jobType,
-      action: targetAction,
-      status: 'pending',
-      campaignName: completedJob.campaignName,
-      bullJobId: null,
-    });
-    em.persist(newJob);
-    await em.flush();
-
-    this.logger.log(`[WORKER] ✅ Created next week DB job: newJob.id=${newJob.id}`);
-
-    const now = Date.now();
-    const delay = executeAt.getTime() - now;
-    const bullJobId = `schedule-${newJob.id}`;
-
-    const existingBullJob = await this.schedulerQueue.getJob(bullJobId);
-    if (existingBullJob) {
-      await this.schedulerQueue.remove(bullJobId);
-    }
-
-    await this.schedulerQueue.add('execute', { jobId: newJob.id }, {
-      delay: Math.max(0, delay),
-      jobId: bullJobId,
-      attempts: 3,
-      backoff: { type: 'exponential', delay: 60000 },
-      removeOnFail: { count: 50 },
-      removeOnComplete: { count: 10 },
-    });
-
-    newJob.bullJobId = bullJobId;
-    await em.flush();
-
-    this.logger.log(`[WORKER] ✅ Re-queued next week job ${bullJobId}`);
   }
 }

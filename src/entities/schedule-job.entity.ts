@@ -1,7 +1,10 @@
-import { Entity, Index, PrimaryKey, Property, ManyToOne } from '@mikro-orm/core';
+import { Entity, Index, PrimaryKey, Property, ManyToOne, Unique } from '@mikro-orm/core';
 import { CampaignSchedule } from './campaign-schedule.entity';
 
 @Entity()
+// One job per slot occurrence: makes next-week creation idempotent across
+// retries, restarts and the chain reconciler.
+@Unique({ name: 'schedule_job_schedule_type_execute_at_unique', properties: ['schedule', 'jobType', 'executeAt'] })
 @Index({ name: 'schedule_job_execute_at_id_index', properties: ['executeAt', 'id'] })
 @Index({ name: 'schedule_job_status_execute_at_index', properties: ['status', 'executeAt'] })
 @Index({ name: 'schedule_job_campaign_id_execute_at_index', properties: ['campaignId', 'executeAt'] })

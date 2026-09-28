@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { EntityManager } from '@mikro-orm/core';
+import { EntityManager, UniqueConstraintViolationException } from '@mikro-orm/core';
 import { CampaignSchedule } from 'src/entities/campaign-schedule.entity';
 import { ScheduleJob } from 'src/entities/schedule-job.entity';
 import { InjectQueue } from '@nestjs/bullmq';
@@ -163,10 +163,15 @@ export class ScheduleExpanderService {
       return;
     }
 
-    const pendingJobs = schedule.jobs.filter(j => j.status === 'pending');
-    if (pendingJobs.length > 0) {
-      this.logger.log(`[CLEANUP] Schedule ${scheduleId} has ${pendingJobs.length} pending jobs, skipping cleanup`);
-      return;
+    // Leftover future jobs (e.g. next week's, created before the user removed
+    // the slot) must not run for a removed schedule: drop them from BullMQ.
+    for (const job of schedule.jobs.filter(j => j.status === 'pending')) {
+      try {
+        const bullJob = await this.schedulerQueue.getJob(`schedule-${job.id}`);
+        if (bullJob && (await bullJob.getState()) !== 'active') await bullJob.remove();
+      } catch (err: any) {
+        this.logger.error(`[CLEANUP] Could not remove queue job schedule-${job.id}: ${err.message}`);
+      }
     }
 
     this.logger.log(`[CLEANUP] Hard-deleting deferred schedule ${scheduleId}`);
@@ -234,6 +239,101 @@ export class ScheduleExpanderService {
     }
 
     return repaired;
+  }
+
+  /** Same PT wall-clock slot time, 7 days after `executeAt` (DST-safe). */
+  plusOneWeekInTargetTz(executeAt: Date, timeStr: string): Date {
+    const zoned = toZonedTime(executeAt, TARGET_TZ);
+    zoned.setDate(zoned.getDate() + 7);
+    const [hour, minute] = timeStr.split(':').map(Number);
+    zoned.setHours(hour, minute, 0, 0);
+    return fromZonedTime(zoned, TARGET_TZ);
+  }
+
+  /**
+   * Create next week's occurrence of `job` if it doesn't exist yet, and make
+   * sure it is in BullMQ. Called BEFORE the job executes, so the weekly chain
+   * continues whether this run succeeds or fails. Idempotent: retries, restarts
+   * and the reconciler converge on the same row (unique schedule/type/executeAt).
+   */
+  async ensureNextWeek(schedule: CampaignSchedule, job: ScheduleJob): Promise<ScheduleJob | null> {
+    const slot = schedule.timeSlots?.[0];
+    if (!slot || !job.executeAt || !job.jobType || !job.action) return null;
+    const timeStr = job.jobType === 'slot_start' ? slot.startTime : slot.endTime;
+    const executeAt = this.plusOneWeekInTargetTz(job.executeAt, timeStr);
+    return this.ensureJob(schedule, job.jobType, job.action, executeAt, job.campaignName ?? schedule.campaignName);
+  }
+
+  /** Idempotently create (if missing) and enqueue (if not in BullMQ) one slot occurrence. */
+  async ensureJob(
+    schedule: CampaignSchedule,
+    jobType: 'slot_start' | 'slot_end',
+    action: 'ENABLE' | 'PAUSE',
+    executeAt: Date,
+    campaignName?: string,
+  ): Promise<ScheduleJob> {
+    const em = this.em.fork();
+    const scheduleRef = em.getReference(CampaignSchedule, schedule.id);
+    const where = { schedule: scheduleRef, jobType, executeAt };
+
+    let job = await em.findOne(ScheduleJob, where);
+    if (!job) {
+      job = em.create(ScheduleJob, {
+        schedule: scheduleRef,
+        campaignId: schedule.campaignId,
+        profileId: schedule.profileId,
+        region: schedule.region,
+        executeAt,
+        jobType,
+        action,
+        status: 'pending',
+        campaignName,
+        bullJobId: null,
+      });
+      try {
+        await em.flush();
+        this.logger.log(`[CHAIN] Created ${jobType} job ${job.id} for schedule ${schedule.id} at ${executeAt.toISOString()}`);
+      } catch (err) {
+        if (!(err instanceof UniqueConstraintViolationException)) throw err;
+        // Another worker/retry created it first — use that one.
+        const fresh = this.em.fork();
+        job = await fresh.findOneOrFail(ScheduleJob, where);
+        return this.ensureEnqueued(fresh, job);
+      }
+    }
+    return this.ensureEnqueued(em, job);
+  }
+
+  /** Put a pending job into BullMQ unless it is already waiting/delayed/active there. */
+  async ensureEnqueued(em: EntityManager, job: ScheduleJob): Promise<ScheduleJob> {
+    if (job.status !== 'pending' || !job.executeAt) return job;
+
+    const bullJobId = `schedule-${job.id}`;
+    const existing = await this.schedulerQueue.getJob(bullJobId);
+    if (existing) {
+      const state = await existing.getState();
+      if (state !== 'completed' && state !== 'failed') {
+        if (job.bullJobId !== bullJobId) {
+          job.bullJobId = bullJobId;
+          await em.flush();
+        }
+        return job;
+      }
+      // A finished BullMQ job with this id would make add() a silent no-op.
+      await existing.remove();
+    }
+
+    await this.schedulerQueue.add('execute', { jobId: job.id }, {
+      delay: Math.max(0, job.executeAt.getTime() - Date.now()),
+      jobId: bullJobId,
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 60000 },
+      removeOnFail: { count: 50 },
+      removeOnComplete: { count: 10 },
+    });
+    job.bullJobId = bullJobId;
+    await em.flush();
+    return job;
   }
 
   private async fetchActive(em: EntityManager, campaignId: string): Promise<CampaignSchedule[]> {
@@ -442,7 +542,7 @@ export class ScheduleExpanderService {
   }
 
 
-  private nextOccurrenceInTargetTz(
+  nextOccurrenceInTargetTz(
     dayOfWeek: number,
     slot: TimeSlot,
   ): { startAt: Date; endAt: Date } {
@@ -606,7 +706,7 @@ export class ScheduleExpanderService {
     }
   }
 
-  private resolveActions(userAction: 'ENABLED' | 'PAUSED') {
+  resolveActions(userAction: 'ENABLED' | 'PAUSED') {
     return userAction === 'ENABLED'
       ? { startAction: 'ENABLE' as const, endAction: 'PAUSE' as const }
       : { startAction: 'PAUSE' as const, endAction: 'ENABLE' as const };

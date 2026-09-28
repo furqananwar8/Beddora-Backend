@@ -15,6 +15,7 @@ import { RedisLifecycleService } from 'src/redis/redis-lifecycle.service';
 import { RedisReconciliationService } from 'src/redis/redis-reconciliation.service';
 import { AlertModule } from '../alert/alert.module';
 import { StartupCheckService } from './service/start-up-check.service';
+import { SchedulerRecoveryService } from './service/scheduler-recovery.service';
 
 @Module({
   imports: [
@@ -34,7 +35,8 @@ import { StartupCheckService } from './service/start-up-check.service';
     CampaignSchedulerWorker,
     RedisLifecycleService,
     RedisReconciliationService,
-    StartupCheckService
+    StartupCheckService,
+    SchedulerRecoveryService
   ],
   exports: [AmazonCampaignApiClient],
 })
