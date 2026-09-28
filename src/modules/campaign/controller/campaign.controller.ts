@@ -47,6 +47,38 @@ function nextIsoDate(value: string): string {
   return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
 }
 
+/**
+ * startDate alone = that single day; with endDate = inclusive range. Days are
+ * whole calendar days in `timezone` (default PT, the zone jobs are scheduled
+ * and displayed in), as [start, nextDay) so it's index-friendly and DST-safe.
+ * Returns null when no dates were given; throws 400 on invalid input.
+ */
+function parseExecuteAtRange(
+  startDate?: string,
+  endDate?: string,
+  timezone?: string,
+): { $gte: Date; $lt: Date } | null {
+  if (endDate && !startDate) {
+    throw new BadRequestException('endDate requires startDate');
+  }
+  if (!startDate) return null;
+  const tz = timezone?.trim() || DEFAULT_LISTING_TZ;
+  if (!isValidTimeZone(tz)) {
+    throw new BadRequestException(`Invalid timezone: ${tz}`);
+  }
+  const end = endDate || startDate;
+  if (!isValidIsoDate(startDate) || !isValidIsoDate(end)) {
+    throw new BadRequestException('startDate and endDate must be valid dates in YYYY-MM-DD format');
+  }
+  if (end < startDate) {
+    throw new BadRequestException('endDate must be on or after startDate');
+  }
+  return {
+    $gte: fromZonedTime(`${startDate}T00:00:00`, tz),
+    $lt: fromZonedTime(`${nextIsoDate(end)}T00:00:00`, tz),
+  };
+}
+
 function isValidTimeZone(tz: string): boolean {
   try {
     new Intl.DateTimeFormat('en-US', { timeZone: tz });
@@ -320,25 +352,9 @@ async listCampaigns(
     // or an inclusive range. Days are whole calendar days in `timezone`, so
     // they line up with the dates the UI displays. Uses [start, nextDay) to
     // stay index-friendly and DST-safe.
-    if (endDate && !startDate) {
-      throw new BadRequestException('endDate requires startDate');
-    }
-    if (startDate) {
-      const tz = timezone?.trim() || DEFAULT_LISTING_TZ;
-      if (!isValidTimeZone(tz)) {
-        throw new BadRequestException(`Invalid timezone: ${tz}`);
-      }
-      const end = endDate || startDate;
-      if (!isValidIsoDate(startDate) || !isValidIsoDate(end)) {
-        throw new BadRequestException('startDate and endDate must be valid dates in YYYY-MM-DD format');
-      }
-      if (end < startDate) {
-        throw new BadRequestException('endDate must be on or after startDate');
-      }
-      where.executeAt = {
-        $gte: fromZonedTime(`${startDate}T00:00:00`, tz),
-        $lt: fromZonedTime(`${nextIsoDate(end)}T00:00:00`, tz),
-      };
+    const executeAtRange = parseExecuteAtRange(startDate, endDate, timezone);
+    if (executeAtRange) {
+      where.executeAt = executeAtRange;
     }
 
     // Whitelist sort fields (unknown fields used to 500) and add `id` as a
@@ -391,7 +407,98 @@ async listCampaigns(
     };
   }
 
- @Delete('scheduled-jobs')
+  @Delete('scheduler/reset')
+  @UseGuards(SessionAuthGuard)
+  @ApiCookieAuth('sid')
+  @ApiOperation({
+    summary: 'Wipe ALL scheduling data: every campaign schedule, every scheduled job, and the campaign-scheduler queue',
+  })
+  @ApiQuery({ name: 'confirm', required: true, type: String, description: 'Must be exactly RESET' })
+  async resetScheduler(@Query('confirm') confirm?: string) {
+    if (confirm !== 'RESET') {
+      throw new BadRequestException('Pass confirm=RESET to wipe all scheduling data');
+    }
+    const em = this.em.fork();
+
+    // DB first, so nothing (worker successor creation, chain repair) can
+    // rebuild jobs from a schedule while the queue is being cleared.
+    const jobsDeleted = await em.nativeDelete(ScheduleJob, {});
+    const schedulesDeleted = await em.nativeDelete(CampaignSchedule, {});
+
+    // Every job in the campaign-scheduler queue; active ones then fail on the missing row.
+    await this.schedulerQueue.obliterate({ force: true });
+
+    this.logger.warn(
+      `[RESET] Wiped scheduling data: ${schedulesDeleted} schedules, ${jobsDeleted} jobs, campaign-scheduler queue cleared`,
+    );
+    return {
+      message: `Reset complete: removed ${schedulesDeleted} schedule(s) and ${jobsDeleted} job(s); queue cleared`,
+      schedulesDeleted,
+      jobsDeleted,
+    };
+  }
+
+  @Delete('scheduled-jobs/range')
+  @UseGuards(SessionAuthGuard)
+  @ApiCookieAuth('sid')
+  @ApiOperation({
+    summary: 'Hard-delete every scheduled job executing in a date range (any status), from Postgres and BullMQ',
+  })
+  @ApiQuery({ name: 'startDate', required: true, type: String, description: 'YYYY-MM-DD. Alone = that single day' })
+  @ApiQuery({ name: 'endDate', required: false, type: String, description: 'YYYY-MM-DD, inclusive' })
+  @ApiQuery({ name: 'timezone', required: false, type: String, description: `IANA zone (default ${DEFAULT_LISTING_TZ})` })
+  async deleteScheduledJobsInRange(
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+    @Query('timezone') timezone?: string,
+  ) {
+    if (!startDate) {
+      throw new BadRequestException('startDate is required');
+    }
+    const range = parseExecuteAtRange(startDate, endDate, timezone)!;
+    const em = this.em.fork();
+
+    const jobs = await em.find(ScheduleJob, { executeAt: range }, { fields: ['id'] });
+    const ids = jobs.map((j) => j.id);
+
+    // Remove from BullMQ first so nothing fires for a row we're deleting.
+    // An 'active' job is mid-execution; it will fail harmlessly on the missing row.
+    let queueRemoved = 0;
+    let activeSkipped = 0;
+    for (let i = 0; i < ids.length; i += 25) {
+      await Promise.all(
+        ids.slice(i, i + 25).map(async (id) => {
+          try {
+            const bullJob = await this.schedulerQueue.getJob(`schedule-${id}`);
+            if (!bullJob) return;
+            if ((await bullJob.getState()) === 'active') {
+              activeSkipped++;
+              return;
+            }
+            await bullJob.remove();
+            queueRemoved++;
+          } catch (err: any) {
+            this.logger.error(`[DELETE-RANGE] Error removing BullMQ job schedule-${id}: ${err.message}`);
+          }
+        }),
+      );
+    }
+
+    const deleted = ids.length ? await em.nativeDelete(ScheduleJob, { id: { $in: ids } }) : 0;
+    this.logger.log(
+      `[DELETE-RANGE] ${startDate}..${endDate || startDate} (${timezone || DEFAULT_LISTING_TZ}): ` +
+        `deleted ${deleted} rows, removed ${queueRemoved} queue jobs, ${activeSkipped} active skipped`,
+    );
+
+    return {
+      message: `Deleted ${deleted} scheduled job(s) between ${startDate} and ${endDate || startDate}`,
+      deleted,
+      queueRemoved,
+      activeSkipped,
+    };
+  }
+
+  @Delete('scheduled-jobs')
   @UseGuards(SessionAuthGuard)
   @ApiCookieAuth('sid')
   @ApiOperation({ summary: 'Delete all future and failed scheduled jobs across all campaigns' })

@@ -16,6 +16,7 @@ import { UserModule } from './modules/user/user.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { HealthModule } from './modules/health/health.module';
 import Redis from 'ioredis';
+import { redisRetryStrategy } from './redis/redis-retry';
 
 @Module({
   imports: [
@@ -43,15 +44,8 @@ import Redis from 'ioredis';
             lazyConnect: true,
             // 🔴 ADD THESE:
             connectTimeout: 5000,       // 5 second connection timeout
-            retryStrategy: (times) => {
-              if (times > 3) {
-                console.log('[REDIS] Max retries (3) reached, stopping reconnection attempts');
-                return null; // null = stop retrying
-              }
-              const delay = Math.min(times * 1000, 3000); // 1s, 2s, 3s
-              console.log(`[REDIS] Reconnect attempt ${times}/3 in ${delay}ms`);
-              return delay;
-            }
+            retryStrategy: redisRetryStrategy('bullmq'),
+          sentinelRetryStrategy: redisRetryStrategy('bullmq-sentinel'),
           });
         } else {
           connection = new Redis({
@@ -62,15 +56,7 @@ import Redis from 'ioredis';
             lazyConnect: true,
             // 🔴 ADD THESE:
             connectTimeout: 5000,
-            retryStrategy: (times) => {
-              if (times > 3) {
-                console.log('[REDIS] Max retries (3) reached, stopping reconnection attempts');
-                return null; // null = stop retrying
-              }
-              const delay = Math.min(times * 1000, 3000); // 1s, 2s, 3s
-              console.log(`[REDIS] Reconnect attempt ${times}/3 in ${delay}ms`);
-              return delay;
-            },
+            retryStrategy: redisRetryStrategy('bullmq'),
           });
         }
 

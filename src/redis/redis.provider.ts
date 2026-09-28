@@ -1,6 +1,7 @@
 import { Provider } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
+import { redisRetryStrategy } from './redis-retry';
 
 export const REDIS_CLIENT = Symbol('REDIS_CLIENT');
 
@@ -27,15 +28,9 @@ export const RedisProvider: Provider = {
           enableReadyCheck: false,
           lazyConnect: true, // ← changed: don't crash on startup if Redis is down
           connectTimeout: 5000,
-          retryStrategy: (times) => {
-            if (times > 3) {
-              console.log('[REDIS] Max retries (3) reached, stopping reconnection attempts');
-              return null; // null = stop retrying
-            }
-            const delay = Math.min(times * 1000, 3000); // 1s, 2s, 3s
-            console.log(`[REDIS] Reconnect attempt ${times}/3 in ${delay}ms`);
-            return delay;
-          },
+          commandTimeout: 5000, // fail fast instead of hanging while Redis is down
+          retryStrategy: redisRetryStrategy('client'),
+          sentinelRetryStrategy: redisRetryStrategy('client-sentinel'),
         })
       : new Redis({
           host: config.get('REDIS_HOST', 'localhost'),
@@ -45,15 +40,8 @@ export const RedisProvider: Provider = {
           enableReadyCheck: false,
           lazyConnect: true,
           connectTimeout: 5000,
-          retryStrategy: (times) => {
-            if (times > 3) {
-              console.log('[REDIS] Max retries (3) reached, stopping reconnection attempts');
-              return null; // null = stop retrying
-            }
-            const delay = Math.min(times * 1000, 3000); // 1s, 2s, 3s
-            console.log(`[REDIS] Reconnect attempt ${times}/3 in ${delay}ms`);
-            return delay;
-          },
+          commandTimeout: 5000, // fail fast instead of hanging while Redis is down
+          retryStrategy: redisRetryStrategy('client'),
         });
 
     // 🔴 THIS IS THE FIX
