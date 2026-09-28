@@ -1,7 +1,15 @@
-import { Entity, PrimaryKey, Property, ManyToOne } from '@mikro-orm/core';
+import { Entity, Index, PrimaryKey, Property, ManyToOne } from '@mikro-orm/core';
 import { CampaignSchedule } from './campaign-schedule.entity';
 
 @Entity()
+@Index({ name: 'schedule_job_execute_at_id_index', properties: ['executeAt', 'id'] })
+@Index({ name: 'schedule_job_status_execute_at_index', properties: ['status', 'executeAt'] })
+@Index({ name: 'schedule_job_campaign_id_execute_at_index', properties: ['campaignId', 'executeAt'] })
+@Index({
+  name: 'schedule_job_campaign_name_trgm_index',
+  expression:
+    'create index "schedule_job_campaign_name_trgm_index" on "schedule_job" using gin ("campaign_name" gin_trgm_ops)',
+})
 export class ScheduleJob {
   @PrimaryKey()
   id!: number;

@@ -28,6 +28,33 @@ import { AmazonProfile, SessionAuthGuard } from 'src/guards/SessionAuth.guard';
 import { SessionService } from 'src/modules/session/service/session.service';
 import * as amazonApiClient from '../../amazon/client/amazon-api.client';
 import { ScheduleExpanderService } from '../service/schedule-expander.service';
+import { fromZonedTime } from 'date-fns-tz';
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const DEFAULT_LISTING_TZ = 'America/Los_Angeles';
+
+/** Validates a YYYY-MM-DD string that is also a real calendar date. */
+function isValidIsoDate(value: string): boolean {
+  if (!ISO_DATE.test(value)) return false;
+  const [y, m, d] = value.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
+/** YYYY-MM-DD + 1 day, computed in UTC so the server's local zone can't shift it. */
+function nextIsoDate(value: string): string {
+  const [y, m, d] = value.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+}
+
+function isValidTimeZone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
 import { SESSION_COOKIE } from 'src/common/constants/session.constant';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -249,6 +276,9 @@ async listCampaigns(
   @ApiQuery({ name: 'sortOrder', required: false, enum: ['asc', 'desc'] })
   @ApiQuery({ name: 'campaignId', required: false, type: String })
   @ApiQuery({ name: 'search', required: false, type: String, description: 'Search by campaign name' })
+  @ApiQuery({ name: 'startDate', required: false, type: String, description: 'YYYY-MM-DD. Alone = that single day; with endDate = start of an inclusive range' })
+  @ApiQuery({ name: 'endDate', required: false, type: String, description: 'YYYY-MM-DD, inclusive. Requires startDate' })
+  @ApiQuery({ name: 'timezone', required: false, type: String, description: `IANA zone the dates are interpreted in (default ${DEFAULT_LISTING_TZ})` })
   async getAllScheduledJobs(
     @Query('page') page?: string,
     @Query('limit') limit?: string,
@@ -257,6 +287,9 @@ async listCampaigns(
     @Query('sortOrder') sortOrder?: 'asc' | 'desc',
     @Query('campaignId') campaignId?: string,
     @Query('search') search?: string,
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+    @Query('timezone') timezone?: string,
   ) {
     const em = this.em.fork();
     
@@ -275,15 +308,47 @@ async listCampaigns(
       where.status = status;
     }
 
-    // Search by campaign name (case-insensitive)
-    if (search?.trim()) {
-      where.campaignName = { $ilike: `%${search.trim()}%` };
+    // Search by campaign name (case-insensitive). Escape LIKE wildcards so
+    // names containing "_" or "%" match literally. Backed by a trigram index.
+    const term = search?.trim().slice(0, 200);
+    if (term) {
+      const escaped = term.replace(/[\\%_]/g, (c) => `\\${c}`);
+      where.campaignName = { $ilike: `%${escaped}%` };
     }
-    
-    const orderBy: any = {};
-    const sortField = sortBy || 'executeAt';
-    orderBy[sortField] = sortOrder || 'asc';
-    
+
+    // Filter by execution date: a single day (startDate only, or start == end)
+    // or an inclusive range. Days are whole calendar days in `timezone`, so
+    // they line up with the dates the UI displays. Uses [start, nextDay) to
+    // stay index-friendly and DST-safe.
+    if (endDate && !startDate) {
+      throw new BadRequestException('endDate requires startDate');
+    }
+    if (startDate) {
+      const tz = timezone?.trim() || DEFAULT_LISTING_TZ;
+      if (!isValidTimeZone(tz)) {
+        throw new BadRequestException(`Invalid timezone: ${tz}`);
+      }
+      const end = endDate || startDate;
+      if (!isValidIsoDate(startDate) || !isValidIsoDate(end)) {
+        throw new BadRequestException('startDate and endDate must be valid dates in YYYY-MM-DD format');
+      }
+      if (end < startDate) {
+        throw new BadRequestException('endDate must be on or after startDate');
+      }
+      where.executeAt = {
+        $gte: fromZonedTime(`${startDate}T00:00:00`, tz),
+        $lt: fromZonedTime(`${nextIsoDate(end)}T00:00:00`, tz),
+      };
+    }
+
+    // Whitelist sort fields (unknown fields used to 500) and add `id` as a
+    // tiebreaker: many jobs share the same executeAt, and without a unique
+    // key Postgres returns ties in arbitrary order, so rows duplicate or go
+    // missing between pages.
+    const sortField = ['executeAt', 'createdAt', 'status'].includes(sortBy || '') ? sortBy! : 'executeAt';
+    const direction = sortOrder === 'desc' ? 'desc' : 'asc';
+    const orderBy: any = { [sortField]: direction, id: direction };
+
     const [jobs, total] = await em.findAndCount(ScheduleJob, where, {
       orderBy,
       limit: limitNum,
