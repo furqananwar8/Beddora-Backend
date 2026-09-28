@@ -180,58 +180,11 @@ export class SchedulerRecoveryService implements OnApplicationBootstrap {
   // ── 3. Chain repair ──────────────────────────────────────────────────────
 
   async reconcileChains(): Promise<void> {
-    const em = this.em.fork();
-    const now = new Date();
-
-    const schedules = await em.find(CampaignSchedule, { isActive: true });
+    const schedules = await this.em.fork().find(CampaignSchedule, { isActive: true });
     if (schedules.length === 0) return;
 
-    // A chain is alive if it has ANY pending/processing job — including an
-    // overdue one still waiting in BullMQ (stale ones were already expired by
-    // catchUpToday). Counting only future jobs made the repair create a
-    // second, duplicate job next to an overdue one. Raw SQL for exact ids.
-    const aliveRows: Array<{ schedule_id: number; job_type: string }> = await em.getConnection().execute(
-      `select distinct schedule_id, job_type from schedule_job where status in ('pending', 'processing')`,
-    );
-    const alive = new Set(aliveRows.map((r) => `${Number(r.schedule_id)}|${r.job_type}`));
-
-    let repaired = 0;
-    for (const schedule of schedules) {
-      const slot = schedule.timeSlots?.[0];
-      if (!slot || schedule.dayOfWeek === undefined || schedule.dayOfWeek === null) continue;
-
-      const { startAction, endAction } = this.expander.resolveActions(schedule.action ?? 'ENABLED');
-      const { startAt, endAt } = this.expander.nextOccurrenceInTargetTz(schedule.dayOfWeek, slot);
-
-      for (const jobType of ['slot_start', 'slot_end'] as const) {
-        if (alive.has(`${schedule.id}|${jobType}`)) continue;
-
-        let executeAt = jobType === 'slot_start' ? startAt : endAt;
-        const action = jobType === 'slot_start' ? startAction : endAction;
-
-        // Mid-slot, the "next" start is today's (already passed). If today's
-        // row exists it was handled (ran / failed / re-run by catch-up), so
-        // continue the chain from next week instead of duplicating it.
-        if (executeAt <= now) {
-          const todays = await em.findOne(ScheduleJob, { schedule, jobType, executeAt });
-          if (todays) {
-            executeAt = this.expander.plusOneWeekInTargetTz(executeAt, jobType === 'slot_start' ? slot.startTime : slot.endTime);
-          }
-        }
-
-        try {
-          const job = await this.expander.ensureJob(schedule, jobType, action, executeAt, schedule.campaignName);
-          repaired++;
-          this.logger.log(
-            `[RECOVERY] 🔗 Restored ${jobType} chain for schedule ${schedule.id} ` +
-              `(${schedule.campaignName ?? schedule.campaignId}, day ${schedule.dayOfWeek}) → job ${job.id} at ${executeAt.toISOString()}`,
-          );
-        } catch (err: any) {
-          this.logger.error(`[RECOVERY] Could not restore ${jobType} chain for schedule ${schedule.id}: ${err.message}`);
-        }
-      }
-    }
-
+    // Same logic Save uses for unchanged slots (ScheduleExpanderService).
+    const repaired = await this.expander.ensureChainsFor(schedules, '[RECOVERY]');
     this.logger.log(`[RECOVERY] Chain repair: ${repaired} chain(s) restored across ${schedules.length} active schedules`);
   }
 }

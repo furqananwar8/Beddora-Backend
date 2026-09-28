@@ -24,6 +24,8 @@ interface SyncResult {
   schedulesRemoved: number;
   jobsCreated: number;
   jobsCancelled: number;
+  /** Missing next-occurrence jobs recreated for unchanged slots. */
+  jobsRepaired: number;
 }
 
 @Injectable()
@@ -132,7 +134,12 @@ export class ScheduleExpanderService {
 
     await em.flush();
 
-    this.logger.log(`[EXPANDER] Result: created=${created}, cancelled=${cancelled}, deferred=${defer.length}`);
+    // Unchanged slots keep their existing jobs, but if a slot's next ENABLE or
+    // PAUSE went missing (failed chain, lost job) recreate it now, so Save also
+    // repairs gaps without deleting anything already scheduled.
+    const repaired = await this.ensureChainsFor(keep, '[SAVE-REPAIR]');
+
+    this.logger.log(`[EXPANDER] Result: created=${created}, cancelled=${cancelled}, deferred=${defer.length}, repaired=${repaired}`);
     this.logger.log(`[EXPANDER] ════════════════════════════════════════════════════════`);
 
     return {
@@ -140,6 +147,7 @@ export class ScheduleExpanderService {
       schedulesRemoved: cancel.length,
       jobsCreated: created,
       jobsCancelled: cancelled,
+      jobsRepaired: repaired,
     };
   }
 
@@ -262,6 +270,86 @@ export class ScheduleExpanderService {
     const timeStr = job.jobType === 'slot_start' ? slot.startTime : slot.endTime;
     const executeAt = this.plusOneWeekInTargetTz(job.executeAt, timeStr);
     return this.ensureJob(schedule, job.jobType, job.action, executeAt, job.campaignName ?? schedule.campaignName);
+  }
+
+  /**
+   * Make sure every given active schedule has a live (pending/processing)
+   * slot_start AND slot_end job; create the next occurrence for any that is
+   * missing. Never deletes or replaces existing jobs; the unique index makes
+   * it safe to call repeatedly. Used by Save (for unchanged slots) and by the
+   * periodic/boot chain repair. Returns how many jobs were created.
+   */
+  async ensureChainsFor(schedules: CampaignSchedule[], logPrefix = '[CHAIN]'): Promise<number> {
+    const active = schedules.filter(
+      (s) => s.isActive !== false && s.timeSlots?.[0] && s.dayOfWeek !== undefined && s.dayOfWeek !== null,
+    );
+    if (active.length === 0) return 0;
+
+    const em = this.em.fork();
+    const now = new Date();
+
+    // Alive = ANY pending/processing job, incl. an overdue one still queued
+    // (counting only future jobs would duplicate it). Raw SQL for exact ids.
+    const ids = active.map((s) => s.id);
+    const aliveRows: Array<{ schedule_id: number; job_type: string }> = await em.getConnection().execute(
+      `select distinct schedule_id, job_type from schedule_job
+        where status in ('pending', 'processing') and schedule_id in (${ids.map(() => '?').join(',')})`,
+      ids,
+    );
+    const alive = new Set(aliveRows.map((r) => `${Number(r.schedule_id)}|${r.job_type}`));
+
+    let created = 0;
+    for (const schedule of active) {
+      const slot = schedule.timeSlots![0];
+      const { startAction, endAction } = this.resolveActions(schedule.action ?? 'ENABLED');
+      const { startAt, endAt } = this.nextOccurrenceInTargetTz(schedule.dayOfWeek, slot);
+
+      for (const jobType of ['slot_start', 'slot_end'] as const) {
+        if (alive.has(`${schedule.id}|${jobType}`)) continue;
+
+        let executeAt = jobType === 'slot_start' ? startAt : endAt;
+        const action = jobType === 'slot_start' ? startAction : endAction;
+
+        try {
+          let existing = await em.findOne(ScheduleJob, { schedule: schedule.id, jobType, executeAt });
+
+          // Mid-slot the "next" start is today's (already passed). If today's
+          // row exists it was handled (ran / failed / re-run), so continue the
+          // chain from next week instead of duplicating it.
+          if (existing && executeAt <= now) {
+            executeAt = this.plusOneWeekInTargetTz(executeAt, jobType === 'slot_start' ? slot.startTime : slot.endTime);
+            existing = await em.findOne(ScheduleJob, { schedule: schedule.id, jobType, executeAt });
+          }
+
+          if (existing) {
+            // The occurrence row exists but isn't live (e.g. failed/cancelled
+            // while still in the future): re-arm it instead of leaving the
+            // slot without an upcoming job. A past one stays as history.
+            if (executeAt <= now) continue;
+            existing.status = 'pending';
+            existing.errorMessage = null;
+            await em.flush();
+            await this.ensureEnqueued(em, existing);
+            created++;
+            this.logger.log(
+              `${logPrefix} ♻️ Re-armed ${jobType} job ${existing.id} for schedule ${schedule.id} ` +
+                `(${schedule.campaignName ?? schedule.campaignId}, day ${schedule.dayOfWeek}) at ${executeAt.toISOString()}`,
+            );
+            continue;
+          }
+
+          const job = await this.ensureJob(schedule, jobType, action, executeAt, schedule.campaignName);
+          created++;
+          this.logger.log(
+            `${logPrefix} 🔗 Restored ${jobType} for schedule ${schedule.id} ` +
+              `(${schedule.campaignName ?? schedule.campaignId}, day ${schedule.dayOfWeek}) → job ${job.id} at ${executeAt.toISOString()}`,
+          );
+        } catch (err: any) {
+          this.logger.error(`${logPrefix} Could not restore ${jobType} for schedule ${schedule.id}: ${err.message}`);
+        }
+      }
+    }
+    return created;
   }
 
   /** Idempotently create (if missing) and enqueue (if not in BullMQ) one slot occurrence. */
