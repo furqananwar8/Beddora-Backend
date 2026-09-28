@@ -6,7 +6,6 @@ import { BullModule } from '@nestjs/bullmq';
 import { AMAZON_PROFILE_TOKEN_REFRESH, AMAZON_TOKEN_REFRESH } from 'src/common/constants/bullmq.constant';
 import { AmazonTokenRefreshProcessor } from './amazon-token-refresh-worker';
 import { HttpModule } from '@nestjs/axios';
-import { ProfileTokenService } from '../session/service/profile-token.service';
 import { AmazonProfileTokenRefreshProcessor } from './amazon-profile-token-refresh.processor';
 import { RedisModule } from 'src/redis/redis.module';
 
@@ -32,7 +31,6 @@ import { RedisModule } from 'src/redis/redis.module';
   ],
    providers: [
     AuthService,
-    ProfileTokenService,
     AmazonTokenRefreshProcessor,
     AmazonProfileTokenRefreshProcessor,
   ],

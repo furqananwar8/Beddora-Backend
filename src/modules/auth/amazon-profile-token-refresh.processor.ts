@@ -2,7 +2,6 @@ import { InjectQueue, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job, Queue } from 'bullmq';
 import { Logger } from '@nestjs/common';
 import { ProfileTokenService } from 'src/modules/session/service/profile-token.service';
-import { AuthService } from './service/auth.service';
 import { REFRESH_JOB_DELAY_MS } from 'src/common/constants/bullmq.constant';
 import { AMAZON_PROFILE_TOKEN_REFRESH } from 'src/common/constants/bullmq.constant';
 
@@ -12,7 +11,6 @@ export class AmazonProfileTokenRefreshProcessor extends WorkerHost {
 
   constructor(
     private readonly profileTokenService: ProfileTokenService,
-    private readonly authService: AuthService,
     @InjectQueue(AMAZON_PROFILE_TOKEN_REFRESH) private readonly tokenRefreshQueue: Queue,
   ) {
     super();
@@ -21,36 +19,34 @@ export class AmazonProfileTokenRefreshProcessor extends WorkerHost {
 
   async process(job: Job<{ profileId: number }>): Promise<void> {
     const { profileId } = job.data;
-
-    const token = await this.profileTokenService.get(profileId);
-    if (!token) {
-      this.logger.warn(`Profile token for profile ${profileId} gone, dropping refresh job`);
-      return;
-    }
+    let keepRefreshing = true;
 
     try {
-      const tokenData = await this.authService.refreshAmazonToken(token.refresh_token);
-
-      if (tokenData.error || !tokenData.access_token) {
-        this.logger.error(`Amazon refresh failed for profile ${profileId}: ${tokenData.error}`);
-        await this.profileTokenService.delete(profileId);
-        throw new Error(`Token refresh failed: ${tokenData.error}`);
+      // Falls back to the Postgres copy if the Redis key was lost; only
+      // returns null when the refresh token is gone or permanently rejected.
+      const token = await this.profileTokenService.getValidToken(profileId, { forceRefresh: true });
+      if (!token) {
+        this.logger.warn(`Profile ${profileId} has no usable refresh token; stopping its refresh chain until the user reconnects`);
+        keepRefreshing = false;
+        return;
       }
-
-      const expiresIn = tokenData.expires_in;
-      const newRefreshToken = tokenData.refresh_token ?? token.refresh_token;
-
-      await this.profileTokenService.update(
-        profileId,
-        {
-          access_token: tokenData.access_token,
-          refresh_token: newRefreshToken,
-          expires_at: Date.now() + expiresIn * 1000,
-        },
-        expiresIn - 60,
-      );
-
       this.logger.log(`Refreshed profile token for profile ${profileId}`);
+    } catch (err: any) {
+      // Transient (network / 5xx / throttling). The stored token is kept, and
+      // scheduled jobs refresh on demand, so just log and try again next cycle.
+      this.logger.error(`Profile token refresh failed for profile ${profileId}: ${err.message}`);
+    } finally {
+      // The chain continues even when this run failed — a single bad refresh
+      // used to end it for good. Skip if another chain for this profile exists.
+      if (keepRefreshing) await this.scheduleNext(profileId, job.id);
+    }
+  }
+
+  private async scheduleNext(profileId: number, currentJobId?: string): Promise<void> {
+    try {
+      const upcoming = await this.tokenRefreshQueue.getJobs(['delayed', 'waiting']);
+      const alreadyScheduled = upcoming.some((j) => j.id !== currentJobId && j.data?.profileId === profileId);
+      if (alreadyScheduled) return;
 
       await this.tokenRefreshQueue.add(
         'refresh-service',
@@ -62,9 +58,8 @@ export class AmazonProfileTokenRefreshProcessor extends WorkerHost {
           removeOnComplete: { count: 10 },
         },
       );
-    } catch (err) {
-      this.logger.error(`Profile token refresh failed for profile ${profileId}`, err);
-      throw err;
+    } catch (err: any) {
+      this.logger.error(`Could not schedule next token refresh for profile ${profileId}: ${err.message}`);
     }
   }
 }

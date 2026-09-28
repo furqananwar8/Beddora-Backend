@@ -4,6 +4,7 @@ import { User } from './entities/user.entity';
 import { CampaignSchedule } from './entities/campaign-schedule.entity';
 import { ScheduleJob } from './entities/schedule-job.entity';
 import { InvitedUser } from './entities/invited-user.entity';
+import { AmazonProfileToken } from './entities/amazon-profile-token.entity';
 
 
 config();
@@ -14,7 +15,7 @@ export default defineConfig({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   dbName: process.env.DB_NAME,
-  entities: [User, CampaignSchedule, ScheduleJob, InvitedUser],
+  entities: [User, CampaignSchedule, ScheduleJob, InvitedUser, AmazonProfileToken],
   debug: true,
   migrations: {
     path: './migrations',
